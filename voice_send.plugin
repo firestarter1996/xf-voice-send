@@ -1,0 +1,198 @@
+__id__ = "voice_send"
+__name__ = "Voice Send"
+__description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
+__author__ = "firestarter1996"
+__version__ = "1.0.0"
+__min_version__ = "12.5.1"
+
+# Why "send" fails in stock XF: Gboard's voice "send" command (SendPerformer) only runs in an app
+# on its built in list (official Telegram, WhatsApp, Signal ...) or in a field that says it takes a
+# send action: imeOptions action SEND, or the private IME option "handlesSendAction". XF uses a
+# different package name and its message field has no send action, so Gboard answers "Command not
+# available in this app" (or types the word). This plugin adds only the "handlesSendAction" private
+# option to the chat message field; imeOptions stay untouched, so the Enter key, Send by Enter,
+# autocorrect and suggestions are unchanged. Gboard then calls performEditorAction(IME_ACTION_SEND),
+# which this plugin answers by pressing the field's own send button (the done button while editing,
+# the slow mode button while slow mode is counting), so schedule mode, silent send, replies, topics,
+# captions and slow mode all behave as a tap. Work happens once per message field and once per
+# spoken "send"; nothing per keystroke or per frame. Logcat tag VoiceSend (errors only).
+
+from java import jclass
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from client_utils import get_last_fragment
+from ui.settings import Header, Switch
+
+TOKEN = "handlesSendAction"
+IME_ACTION_SEND = 4
+
+
+def _log(msg):
+    try:
+        jclass("android.util.Log").i("VoiceSend", str(msg))
+    except Exception:
+        pass
+
+
+def _without(opts):
+    parts = [p for p in str(opts or "").replace(";", ",").split(",") if p and p.strip() != TOKEN]
+    return ",".join(parts) if parts else None
+
+
+class VoiceSendPlugin(BasePlugin):
+
+    def create_settings(self):
+        return [
+            Header(text="Voice Send"),
+            Switch(key="enabled", text="Say \"send\" to send", default=True,
+                   subtext="While dictating with Gboard voice typing, saying send sends the message like the send button.",
+                   on_change=self._on_toggle),
+        ]
+
+    def on_plugin_load(self):
+        self.errors = 0
+        WeakHashMap = jclass("java.util.WeakHashMap")
+        Collections = jclass("java.util.Collections")
+        self.fields = Collections.synchronizedMap(WeakHashMap())
+        self.VISIBLE = 0
+        caev = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+        tv = find_class("android.widget.TextView")
+        if caev is None or tv is None:
+            _log("classes not found")
+            return
+        self.caev = caev
+        plugin = self
+
+        class CreateHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plugin._prep(get_private_field(param.thisObject, "messageEditText"))
+                except Exception as e:
+                    plugin._err("create", e)
+
+        class ActionHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    if int(param.args[0]) != IME_ACTION_SEND or not plugin.fields.containsKey(param.thisObject):
+                        return
+                    if not plugin.get_setting("enabled", True):
+                        return
+                    plugin._send(param.thisObject)
+                    param.setResult(True)
+                except Exception as e:
+                    plugin._err("send", e)
+
+        create = None
+        for m in caev.getDeclaredMethods():
+            if m.getName() == "createMessageEditText" and len(m.getParameterTypes()) == 0:
+                create = m
+        if create is None:
+            _log("createMessageEditText not found")
+            return
+        self.hook_method(create, CreateHook())
+        self.hook_method(tv.getDeclaredMethod("onEditorAction", jclass("java.lang.Integer").TYPE), ActionHook())
+        AU = jclass("org.telegram.messenger.AndroidUtilities")
+        AU.runOnUIThread(self._r(self._prep_open))
+        _log("loaded %s" % __version__)
+
+    def _r(self, fn):
+        from android_utils import R
+        self._keep = R(fn)
+        return self._keep
+
+    def on_plugin_unload(self):
+        try:
+            for f in list(self.fields.keySet().toArray()):
+                if f is not None:
+                    f.setPrivateImeOptions(_without(f.getPrivateImeOptions()))
+        except Exception as e:
+            self._err("unload", e)
+
+    def _err(self, where, e):
+        if self.errors < 5:
+            self.errors += 1
+            _log("%s: %s" % (where, e))
+
+    def _prep(self, field):
+        """Once per message field: tell the keyboard this field takes a send action."""
+        if field is None:
+            return
+        self.fields.put(field, True)
+        if not self.get_setting("enabled", True):
+            return
+        opts = field.getPrivateImeOptions()
+        cur = str(opts) if opts is not None else ""
+        if TOKEN in cur.replace(";", ",").split(","):
+            return
+        field.setPrivateImeOptions(TOKEN if not cur else cur + "," + TOKEN)
+        if field.hasFocus():
+            imm = field.getContext().getSystemService("input_method")
+            if imm is not None:
+                imm.restartInput(field)
+
+    def _prep_open(self):
+        """At load: the chats already open get the option too."""
+        try:
+            f = get_last_fragment()
+            stack = f.getParentLayout().getFragmentStack() if f is not None else None
+            if stack is None:
+                return
+            for i in range(stack.size()):
+                ev = get_private_field(stack.get(i), "chatActivityEnterView")
+                if ev is not None:
+                    self._prep(get_private_field(ev, "messageEditText"))
+        except Exception as e:
+            self._err("open chats", e)
+
+    def _on_toggle(self, enabled):
+        try:
+            for f in list(self.fields.keySet().toArray()):
+                if f is None:
+                    continue
+                if enabled:
+                    self._prep(f)
+                else:
+                    f.setPrivateImeOptions(_without(f.getPrivateImeOptions()))
+                    if f.hasFocus():
+                        imm = f.getContext().getSystemService("input_method")
+                        if imm is not None:
+                            imm.restartInput(f)
+        except Exception as e:
+            self._err("toggle", e)
+
+    def _outer(self, field):
+        c = field.getClass()
+        while c is not None:
+            try:
+                fl = c.getDeclaredField("this$0")
+                fl.setAccessible(True)
+                v = fl.get(field)
+                if self.caev.isInstance(v):
+                    return v
+            except Exception:
+                pass
+            c = c.getSuperclass()
+        return None
+
+    def _shown(self, v):
+        return v is not None and v.getVisibility() == self.VISIBLE and v.isShown() and float(v.getAlpha()) > 0.5
+
+    def _send(self, field):
+        """Press the button a finger would press now."""
+        ev = self._outer(field)
+        if ev is None:
+            return
+        if ev.isEditingMessage():
+            done = get_private_field(ev, "doneButton")
+            if self._shown(done):
+                done.performClick()
+            else:
+                ev.doneEditingMessage()
+            return
+        sb = ev.getSendButtonInternal()
+        if self._shown(sb) and sb.isEnabled():
+            sb.performClick()
+            return
+        slow = get_private_field(ev, "slowModeButton")
+        if self._shown(slow):
+            slow.performClick()
