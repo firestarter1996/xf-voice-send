@@ -1,8 +1,8 @@
 __id__ = "voice_send"
 __name__ = "Voice Send"
-__description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
+__description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Say \"paste\" and the clipboard text goes in. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __min_version__ = "12.5.1"
 
 # Two routes to the same tap of the send button.
@@ -25,6 +25,12 @@ __min_version__ = "12.5.1"
 #    an event driven AudioRecordingCallback) the word is dropped and the send button is pressed.
 #    Whatever word comes before it. Not a command: typed or swiped text (no microphone), "send" in
 #    the middle of a chunk ("send it to Tim") and longer words ("resend").
+#
+# 3. Spoken "paste" (Gboard may write "past"). The same watch, the same voice typing window: when
+#    the last word of a finished chunk is "paste", the word is replaced by the clipboard text,
+#    without sending. "paste send" pastes, then sends. An empty clipboard leaves the word as text.
+#    Stays text after "copy and", "cut and", "copy", "the", "half", "went" and similar words.
+#    The clipboard is read only at that moment and never logged.
 #
 # Cost: one Python call per commitText and finishComposingText of the message field (once per word,
 # never per letter: letters go through setComposingText, which is not hooked) and a string test on
@@ -55,25 +61,72 @@ def _log(msg):
         pass
 
 
+def _hint(s):
+    """Cheap first test on the last few letters: could the chunk end in send, paste or past?"""
+    low = s[-8:].lower()
+    return "end" in low or "ast" in low
+
+
 def _without(opts):
     parts = [p for p in str(opts or "").replace(";", ",").split(",") if p and p.strip() != TOKEN]
     return ",".join(parts) if parts else None
 
 
-def _maybe_send(s):
-    """If the chunk's last word is the command "send", return the text to keep in its place."""
-    if not s:
-        return None
-    t = s.rstrip(_TRAIL)
-    if len(t) < 4 or t[-4:].lower() != "send":
-        return None
-    head = t[:-4]
-    if head and (head[-1].isalnum() or head[-1] in "'\u2019_-"):
-        return None  # part of a longer word: resend, godsend
+# "paste" (Gboard may write it "past") stays text after these words: "copy and paste",
+# "cut and paste", "copy paste", "the past", "half past", "went past" and the like.
+_PASTE_TEXT_AFTER = {"the", "copy", "half", "quarter", "went", "go", "goes", "going",
+                     "walked", "drove", "ran", "get", "got", "way", "long", "far"}
+
+
+def _cut(t, words):
+    """If t ends with one of words as a whole word (any case), return (text before it, word)."""
+    low = t[-6:].lower()
+    for w in words:
+        if low.endswith(w):
+            head = t[:-len(w)]
+            if head and (head[-1].isalnum() or head[-1] in "'\u2019_-"):
+                return None  # part of a longer word: resend, toothpaste
+            return head, w
+    return None
+
+
+def _tidy(head):
     keep = head.rstrip()
     if keep.endswith(","):
         keep = keep[:-1].rstrip()
     return keep
+
+
+def _parse(s):
+    """Spoken commands at the end of a finished chunk.
+
+    Returns None, or (text without "send", send, head before "paste" or None)."""
+    if not s:
+        return None
+    t = s.rstrip(_TRAIL)
+    send = False
+    c = _cut(t, ("send",))
+    if c is not None:
+        send = True
+        t = _tidy(c[0])
+    paste = None
+    c = _cut(t.rstrip(_TRAIL), ("paste", "past"))
+    if c is not None:
+        words = c[0].lower().replace(",", " ").split()
+        prev = words[-1] if words else ""
+        if prev == "and" and len(words) > 1 and words[-2] in ("copy", "cut"):
+            prev = "copy"
+        if prev not in _PASTE_TEXT_AFTER:
+            paste = c[0]
+    if not send and paste is None:
+        return None
+    return t, send, paste
+
+
+def _maybe_send(s):
+    """Text to keep in place of a chunk whose last word is "send" (used by the tests)."""
+    r = _parse(s)
+    return r[0] if r and r[1] else None
 
 
 class VoiceSendPlugin(BasePlugin):
@@ -84,12 +137,15 @@ class VoiceSendPlugin(BasePlugin):
             Switch(key="enabled", text="Say \"send\" to send", default=True,
                    subtext="While dictating with Gboard voice typing, saying send sends the message like the send button.",
                    on_change=self._on_toggle),
+            Switch(key="paste", text="Say \"paste\" to paste", default=True,
+                   subtext="While dictating, saying paste as the last word puts the clipboard text in the message box instead of the word."),
         ]
 
     def on_plugin_load(self):
         self.errors = 0
         self.fired = 0
         self.debug = False
+        self.ctx = None
         WeakHashMap = jclass("java.util.WeakHashMap")
         Collections = jclass("java.util.Collections")
         self.fields = Collections.synchronizedMap(WeakHashMap())
@@ -108,6 +164,7 @@ class VoiceSendPlugin(BasePlugin):
         try:
             import os
             ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+            self.ctx = ctx
             self.audio = ctx.getSystemService("audio")
             self.debug = os.path.exists(os.path.join(str(ctx.getFilesDir().getAbsolutePath()), "voice_send_debug"))
         except Exception as e:
@@ -165,18 +222,22 @@ class VoiceSendPlugin(BasePlugin):
                     s = str(s) if s is not None else None
                     if plugin.debug:
                         plugin._trace("commit", s, field)
-                    if not s or "end" not in s[-8:].lower():
+                    if not s or not _hint(s):
                         return
-                    keep = _maybe_send(s)
-                    if keep is None or not plugin.get_setting("enabled", True):
+                    r = _parse(s)
+                    if r is None or not plugin.get_setting("enabled", True):
                         return
-                    if plugin._recent():
-                        param.args[0] = keep
+                    if r[1] and r[2] is None and plugin._recent():
+                        param.args[0] = r[0]
                         return
                     if not plugin._mic_on():
                         return
-                    param.args[0] = keep
-                    plugin._fire(field)
+                    text = plugin._apply(r)
+                    if text is None:
+                        return
+                    param.args[0] = text
+                    if r[1]:
+                        plugin._fire(field)
                 except Exception as e:
                     plugin._err("commit", e)
 
@@ -192,20 +253,24 @@ class VoiceSendPlugin(BasePlugin):
                     if a < 0 or b <= a:
                         return
                     s = str(ed.subSequence(max(a, b - 8), b))
-                    if "end" not in s.lower():
+                    if not _hint(s):
                         if plugin.debug:
                             plugin._trace("finish", s, field)
                         return
                     s = str(ed.subSequence(a, b))
                     if plugin.debug:
                         plugin._trace("finish", s, field)
-                    keep = _maybe_send(s)
-                    if keep is None or not plugin.get_setting("enabled", True):
+                    r = _parse(s)
+                    if r is None or not plugin.get_setting("enabled", True):
                         return
-                    if not plugin._recent() and not plugin._mic_on():
+                    recent = r[1] and r[2] is None and plugin._recent()
+                    if not recent and not plugin._mic_on():
                         return
-                    ed.replace(a, b, keep)
-                    if not plugin._recent():
+                    text = plugin._apply(r)
+                    if text is None:
+                        return
+                    ed.replace(a, b, text)
+                    if r[1] and not recent:
                         plugin._fire(field)
                 except Exception as e:
                     plugin._err("finish", e)
@@ -305,6 +370,36 @@ class VoiceSendPlugin(BasePlugin):
         if s is not None and len(s) > 20:
             s = "<%d chars>...%s" % (len(s), s[-10:])
         _log("trace %s %r mic=%s" % (what, s, self._mic_on()))
+
+    def _apply(self, r):
+        """Text that replaces the finished chunk, or None to leave it as dictated."""
+        keep, send, paste = r
+        if paste is None or not self.get_setting("paste", True):
+            return keep if send else None
+        clip = self._clip()
+        if not clip:
+            return keep if send else None  # empty clipboard: "paste" stays as text
+        base = _tidy(paste)
+        text = (base + " " + clip) if base.strip() else (paste + clip)
+        _log("spoken paste: word dropped, clipboard text inserted")
+        return text
+
+    def _clip(self):
+        """The clipboard's text, read only at the moment a spoken paste fires. Never logged."""
+        try:
+            cm = self.ctx.getSystemService("clipboard")
+            if self.debug:
+                _log("trace clip has=%s" % (cm is not None and cm.hasPrimaryClip()))
+            if cm is None or not cm.hasPrimaryClip():
+                return None
+            c = cm.getPrimaryClip()
+            if c is None or c.getItemCount() < 1:
+                return None
+            t = c.getItemAt(0).coerceToText(self.ctx)
+            return str(t) if t is not None and len(t) > 0 else None
+        except Exception as e:
+            self._err("clip", e)
+            return None
 
     def _recent(self):
         return self.fired and self.SystemClock.uptimeMillis() - self.fired < GUARD_MS

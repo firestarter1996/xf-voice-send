@@ -1,6 +1,6 @@
 # 🎙️🗣️📤 Voice Send
 
-A plugin for Nagram XF. While you dictate with Gboard voice typing, say "send" and the message goes out, exactly like tapping the send button.
+A plugin for Nagram XF. While you dictate with Gboard voice typing, say "send" and the message goes out, exactly like tapping the send button. Say "paste" and whatever you copied goes into the message box.
 
 ## Why I made it
 
@@ -12,12 +12,15 @@ Gboard's voice typing understands "send" in Telegram, WhatsApp and a few other a
 * It fires on the first try, even when you say "send" straight after the sentence with no pause, or right after a spoken punctuation command ("close parenthesis", "period", "question mark" and so on). In those cases Gboard on its own types the word instead; the plugin removes it and sends. The word never lands in the message.
 * What counts as the command: "send" as the last word of what you just dictated, whatever word comes before it, in any case, with or without a period after it. "That looks good send" goes out as "that looks good".
 * What stays text: typed or swiped "send", "send" in the middle ("send it to Tim") and longer words ("resend").
+* Saying "paste" as the last word puts your clipboard text in the message box in place of the word, without sending. Gboard sometimes writes it "past"; both count. "Paste send" pastes, then sends.
+* "Paste" stays text after "copy and", "cut and", "copy", "the", "half", "quarter", "went", "go", "goes", "going", "walked", "drove", "ran", "get", "got", "way", "long" and "far", so "copy and paste", "in the past" and "half past" are typed as words. With an empty clipboard the word stays as text too.
+* The clipboard is read only at the moment you say "paste", and its text is never logged. A second switch turns paste off.
 * While you edit a message, "send" saves the edit, like the check mark.
 * In slow mode it does what tapping the timer does.
 * The Enter key still makes a new line, your Send by Enter setting stays as it is, and autocorrect and suggestions are unchanged.
 * Work happens once when a chat's message field is created, a short text check once per finished word, and once for each spoken "send". Nothing runs per letter or per frame.
 
-Setting: one switch turns it off.
+Settings: one switch for send, one for paste.
 
 ## Install
 
@@ -47,6 +50,15 @@ Nagram XF 12.10.1 plugin build on a Pixel 6 Pro with Gboard 18.5:
 * The same chunk finished through `setComposingText` plus `finishComposingText` also sent.
 * With the microphone off, ") send" and "send" stay as typed text, and "please send" never triggers.
 * The extra hook costs about 0.15 ms per finished word.
+
+Version 1.3.0, same phone, same method, with a test text on the 6 Pro's clipboard:
+
+* "VS p1 here it is paste" became "VS p1 here it is" plus the clipboard text, not sent.
+* "VS p2 look at this paste send" went out with the clipboard text in place of "paste".
+* "VS p3 the link is past" as composing text plus `finishComposingText` pasted.
+* "copy and paste", "in the past" and "cut and paste" stayed as text with the microphone on.
+* With an empty clipboard, "VS p5 empty paste" stayed as text.
+* With the microphone off for more than 3 seconds, "VS p6 typed paste" stayed as text.
 
 Version 1.2.0, same phone, Gboard voice typing listening, chunks replayed into the field's InputConnection:
 
