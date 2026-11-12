@@ -1,8 +1,8 @@
 __id__ = "voice_send"
 __name__ = "Voice Send"
-__description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Say \"paste\" and the clipboard text goes in. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
+__description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Say \"paste\" and the clipboard text goes in. Say \"screenshot\" or \"picture\" and your newest screenshot or camera photo is attached, say it again for the one before. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __min_version__ = "12.5.1"
 
 # Two routes to the same tap of the send button.
@@ -32,6 +32,31 @@ __min_version__ = "12.5.1"
 #    Stays text after "copy and", "cut and", "copy", "the", "half", "went" and similar words.
 #    The clipboard is read only at that moment and never logged.
 #
+# 4. Spoken "screenshot" (also "screen shot", "screenshots"). The same watch, the same voice typing
+#    window: when the last word of a finished chunk is "screenshot", the word is dropped and the
+#    newest screenshot on the phone is put in a small tray above the message box, not sent yet.
+#    Every further "screenshot" adds the next newest one (never the same file twice, ten at most).
+#    Sending the message (by voice, the send button or Enter) sends the tray as one album through
+#    the app's own ChatActivity.didSelectSearchPhotos, the text in the box as its caption.
+#    "screenshot send" attaches, then sends. The tray empties when the message goes out, when its X
+#    is tapped, when the box is emptied by hand and when the chat is left. Stays text after "a",
+#    "the", "this", "my", "of", "take" and similar words, and while a message is being edited.
+#    Stock XF has no place for a photo to wait in the message box: its attach sheet is a separate
+#    window that takes the keyboard (and so the dictation) away, and it forgets its ticked photos
+#    every time it opens. So the tray is the plugin's own (ShotTray, Java, in the dex below).
+#    The lookup (one MediaStore query for the newest rows) and the thumbnail run on a background
+#    thread. While the tray is empty nothing of it is registered.
+#
+# 5. Spoken "picture". Exactly like "screenshot", for the newest photo of the camera roll
+#    (DCIM/Camera, pictures only, no videos). Both kinds share one tray, so "screenshot", "picture",
+#    "picture" makes one album in the order spoken. Its own switch.
+#
+# 6. A long press on the paperclip. Not a voice command, but the same tray: holding the paperclip
+#    adds the newest screenshot, then the one before it about every 0.7 seconds until the finger
+#    lifts, with a light tick each (unless the app's vibration is off). A short tap still opens the
+#    attach menu; stock XF has nothing on a long press of that button. ClipHold (Java): the view's
+#    own long press detection plus one posted repeat while held. Its own switch.
+#
 # Cost: one Python call per commitText and finishComposingText of the message field (once per word,
 # never per letter: letters go through setComposingText, which is not hooked) and a string test on
 # the end of the chunk; no binder call, nothing per frame, no polling. The microphone state comes
@@ -51,6 +76,9 @@ IME_ACTION_SEND = 4
 GUARD_MS = 1500
 VOICE_GRACE_MS = 3000
 MICWATCH = "com.firestarter.voicesend.MicWatch"
+SHOTTRAY = "com.firestarter.voicesend.ShotTray"
+CLIPHOLD = "com.firestarter.voicesend.ClipHold"
+CAPTION_MAX = 1024
 _TRAIL = " \t\n.!?"
 
 
@@ -62,9 +90,9 @@ def _log(msg):
 
 
 def _hint(s):
-    """Cheap first test on the last few letters: could the chunk end in send, paste or past?"""
+    """Cheap first test on the last few letters: could the chunk end in send, paste, past or screenshot?"""
     low = s[-8:].lower()
-    return "end" in low or "ast" in low
+    return "end" in low or "ast" in low or "hot" in low or "ture" in low
 
 
 def _without(opts):
@@ -75,7 +103,56 @@ def _without(opts):
 # "paste" (Gboard may write it "past") stays text after these words: "copy and paste",
 # "cut and paste", "copy paste", "the past", "half past", "went past" and the like.
 _PASTE_TEXT_AFTER = {"the", "copy", "half", "quarter", "went", "go", "goes", "going",
-                     "walked", "drove", "ran", "get", "got", "way", "long", "far"}
+                     "walked", "drove", "ran",  "way", "long", "far"}
+
+
+# "screenshot" stays text after these words: "take a screenshot", "the screenshot", "send me a
+# screenshot", "see screenshot", "this screenshot" and the like.
+_SHOT_TEXT_AFTER = {"a", "an", "the", "this", "that", "these", "those", "my", "your", "his", "her",
+                    "its", "our", "their", "another", "one", "two", "three", "few", "some", "any",
+                    "no", "each", "every", "of", "in", "on", "with", "via", "by", "from", "to",
+                    "for", "per", "see", "attached", "new", "old", "last", "latest", "recent",
+                    "first", "second", "next", "previous", "same", "full", "quick", "and", "or",
+                    "take", "takes", "took", "taking", "taken", "send", "sent", "sending", "sends",
+                    "share", "shared", "grab", "grabbed", "that's", "it's", "big", "small", "long",
+                    "whole", "blurry", "many", "several", "profile", "motion", "bigger", "good",
+                    "nice", "great", "cute", "pretty", "beautiful", "perfect", "best", "family",
+                    "group", "wedding", "clear", "clearer", "better", "pretty", "mental", "in",
+                    "paint", "paints", "painted", "snap", "snapped", "shoot", "shot", "like", "you"}
+# spoken word -> kind for ShotTray.add (0 screenshot, 1 camera picture)
+_SHOT_WORDS = (("screenshots", 0), ("screenshot", 0), ("screen shots", 0), ("screen shot", 0), ("picture", 1))
+
+
+def _shots(t, kinds_on=(True, True)):
+    """Trailing spoken "screenshot" and "picture" words: (text before them, kinds in spoken order), or None."""
+    kinds = []
+    head = t
+    while len(kinds) < 10:
+        cur = head.rstrip(_TRAIL + ",")
+        low = cur[-12:].lower()
+        hit = None
+        for w, k in _SHOT_WORDS:
+            if kinds_on[k] and low.endswith(w):
+                rest = cur[:-len(w)]
+                if rest and (rest[-1].isalnum() or rest[-1] in "'\u2019_-"):
+                    continue
+                hit = rest
+                kinds.insert(0, k)
+                break
+        if hit is None:
+            break
+        head = hit
+    if not kinds:
+        return None
+    if _shot_is_text(head):
+        return None
+    return head, kinds
+
+
+def _shot_is_text(head):
+    """Do the words before "screenshot" make it an ordinary word ("take a", "the", "this")?"""
+    words = head.lower().replace(",", " ").split()
+    return bool(words) and words[-1] in _SHOT_TEXT_AFTER
 
 
 def _cut(t, words):
@@ -97,10 +174,11 @@ def _tidy(head):
     return keep
 
 
-def _parse(s):
+def _parse(s, shots_on=True, pics_on=True):
     """Spoken commands at the end of a finished chunk.
 
-    Returns None, or (text without "send", send, head before "paste" or None)."""
+    Returns None, or (text without "send" and "screenshot", send, head before "paste" or None,
+    the kinds of "screenshot" (0) and "picture" (1) said, in order)."""
     if not s:
         return None
     t = s.rstrip(_TRAIL)
@@ -109,6 +187,12 @@ def _parse(s):
     if c is not None:
         send = True
         t = _tidy(c[0])
+    shots = []
+    if shots_on or pics_on:
+        c = _shots(t, (shots_on, pics_on))
+        if c is not None:
+            shots = c[1]
+            t = _tidy(c[0])
     paste = None
     c = _cut(t.rstrip(_TRAIL), ("paste", "past"))
     if c is not None:
@@ -118,9 +202,9 @@ def _parse(s):
             prev = "copy"
         if prev not in _PASTE_TEXT_AFTER:
             paste = c[0]
-    if not send and paste is None:
+    if not send and paste is None and not shots:
         return None
-    return t, send, paste
+    return t, send, paste, shots
 
 
 def _maybe_send(s):
@@ -139,11 +223,20 @@ class VoiceSendPlugin(BasePlugin):
                    on_change=self._on_toggle),
             Switch(key="paste", text="Say \"paste\" to paste", default=True,
                    subtext="While dictating, saying paste as the last word puts the clipboard text in the message box instead of the word."),
+            Switch(key="screenshot", text="Say \"screenshot\" to attach", default=True,
+                   subtext="While dictating, saying screenshot as the last word attaches your newest screenshot to the message you are writing. Say it again for the one before it. Nothing is sent until you send.",
+                   on_change=self._on_shot_toggle),
+            Switch(key="picture", text="Say \"picture\" to attach", default=True,
+                   subtext="While dictating, saying picture as the last word attaches the newest photo from your camera roll to the message you are writing. Say it again for the one before it. Nothing is sent until you send."),
+            Switch(key="clip_hold", text="Hold the paperclip for screenshots", default=True,
+                   subtext="A long press on the paperclip attaches your newest screenshot and keeps adding the one before it while you hold. A short tap opens the attach menu as before.",
+                   on_change=self._on_clip_toggle),
         ]
 
     def on_plugin_load(self):
         self.errors = 0
         self.fired = 0
+        self.in_commit = 0
         self.debug = False
         self.ctx = None
         WeakHashMap = jclass("java.util.WeakHashMap")
@@ -177,6 +270,24 @@ class VoiceSendPlugin(BasePlugin):
         except Exception as e:
             self.mic = None
             self._err("micwatch", e)
+        self.tray = None
+        try:
+            if self.mic is not None:
+                self.tray = self._tray_static(self.loader.loadClass(SHOTTRAY))
+        except Exception as e:
+            self.tray = None
+            self._err("shottray", e)
+        self.clip = None
+        try:
+            if self.tray is not None:
+                self.clip = self.loader.loadClass(CLIPHOLD)
+                self.clip.getField("enabled").setBoolean(None, bool(self.get_setting("clip_hold", True)))
+                V = jclass("android.view.View")
+                self.clip_arm = self.clip.getMethod("arm", V, V, jclass("android.widget.EditText"),
+                                                    jclass("android.view.ViewGroup"), jclass("java.lang.Object"))
+        except Exception as e:
+            self.clip = None
+            self._err("cliphold", e)
 
         class CreateHook(MethodHook):
             def after_hooked_method(self, param):
@@ -224,10 +335,10 @@ class VoiceSendPlugin(BasePlugin):
                         plugin._trace("commit", s, field)
                     if not s or not _hint(s):
                         return
-                    r = _parse(s)
+                    r = plugin._read(s, field)
                     if r is None or not plugin.get_setting("enabled", True):
                         return
-                    if r[1] and r[2] is None and plugin._recent():
+                    if r[1] and r[2] is None and not r[3] and plugin._recent():
                         param.args[0] = r[0]
                         return
                     if not plugin._mic_on():
@@ -235,11 +346,17 @@ class VoiceSendPlugin(BasePlugin):
                     text = plugin._apply(r)
                     if text is None:
                         return
+                    if r[3]:
+                        plugin._shoot(field, r[3])
+                    plugin.in_commit = plugin.SystemClock.uptimeMillis()
                     param.args[0] = text
                     if r[1]:
                         plugin._fire(field)
                 except Exception as e:
                     plugin._err("commit", e)
+
+            def after_hooked_method(self, param):
+                plugin.in_commit = 0
 
         class FinishHook(MethodHook):
             def before_hooked_method(self, param):
@@ -247,6 +364,8 @@ class VoiceSendPlugin(BasePlugin):
                     field = plugin.ics.get(param.thisObject)
                     if field is None:
                         return
+                    if plugin.in_commit and plugin.SystemClock.uptimeMillis() - plugin.in_commit < 500:
+                        return  # the field finishing its own text inside a commit that was just handled
                     ed = field.getText()
                     a = plugin.BIC.getComposingSpanStart(ed)
                     b = plugin.BIC.getComposingSpanEnd(ed)
@@ -260,20 +379,40 @@ class VoiceSendPlugin(BasePlugin):
                     s = str(ed.subSequence(a, b))
                     if plugin.debug:
                         plugin._trace("finish", s, field)
-                    r = _parse(s)
+                    r = plugin._read(s, field)
                     if r is None or not plugin.get_setting("enabled", True):
                         return
-                    recent = r[1] and r[2] is None and plugin._recent()
+                    recent = r[1] and r[2] is None and not r[3] and plugin._recent()
                     if not recent and not plugin._mic_on():
                         return
                     text = plugin._apply(r)
                     if text is None:
                         return
+                    if r[3]:
+                        plugin._shoot(field, r[3])
                     ed.replace(a, b, text)
                     if r[1] and not recent:
                         plugin._fire(field)
                 except Exception as e:
                     plugin._err("finish", e)
+
+        class SendHook(MethodHook):
+            """Every way of sending the box ends here. Screenshots waiting: they go out as an album."""
+            def before_hooked_method(self, param):
+                try:
+                    ev = param.thisObject
+                    if plugin.tray is None or not plugin.caev.isInstance(ev):
+                        return
+                    if plugin.tray.busy(ev):
+                        plugin.tray.when_ready(ev, plugin._r2(lambda: plugin._again(ev)))
+                        param.setResult(False)
+                        return
+                    if plugin.tray.count(ev) <= 0 or ev.isEditingMessage():
+                        return
+                    if plugin._send_media(ev, bool(param.args[0]), int(param.args[1])):
+                        param.setResult(False)
+                except Exception as e:
+                    plugin._err("send hook", e)
 
         class ComposeTrace(MethodHook):
             def before_hooked_method(self, param):
@@ -305,6 +444,22 @@ class VoiceSendPlugin(BasePlugin):
         # because EditableInputConnection reaches it by a direct super call inside the boot image.
         self.hook_method(icw.getDeclaredMethod("commitText", CS, INT), CommitHook())
         self.hook_method(icw.getDeclaredMethod("finishComposingText"), FinishHook())
+        if self.tray is not None:
+            try:
+                smi = None
+                for m in caev.getDeclaredMethods():
+                    if m.getName() == "sendMessageInternal" and len(m.getParameterTypes()) == 6:
+                        smi = m
+                if smi is not None:
+                    self.hook_method(smi, SendHook())
+                else:
+                    self.tray = None
+                    _log("sendMessageInternal not found, spoken screenshot and picture are off")
+            except Exception as e:
+                self.tray = None
+                self._err("send hook", e)
+        if self.tray is None:
+            self.clip = None
         if self.debug:
             self.hook_method(icw.getDeclaredMethod("setComposingText", CS, INT), ComposeTrace())
         AU = jclass("org.telegram.messenger.AndroidUtilities")
@@ -343,12 +498,76 @@ class VoiceSendPlugin(BasePlugin):
                 return r if isinstance(r, bool) else bool(r.booleanValue())
         return Static()
 
+    def _tray_static(self, cls):
+        """Wrap the ShotTray class so its static methods can be called from Python."""
+        V = jclass("android.view.View")
+        INT = jclass("java.lang.Integer").TYPE
+        Integer = jclass("java.lang.Integer")
+        add = cls.getMethod("add", V, jclass("android.widget.EditText"), jclass("android.view.ViewGroup"),
+                            jclass("java.lang.Object"), INT, INT)
+        count = cls.getMethod("count", V)
+        busy = cls.getMethod("busy", V)
+        ready = cls.getMethod("whenReady", V, jclass("java.lang.Runnable"))
+        take = cls.getMethod("take", V)
+        clear = cls.getMethod("clear", V)
+        clear_all = cls.getMethod("clearAll")
+        quiet = cls.getMethod("quiet", V)
+
+        def _b(r):
+            return r if isinstance(r, bool) else bool(r.booleanValue())
+
+        class Static:
+            def add(self, ev, field, content, bubble, n, kind):
+                add.invoke(None, ev, field, content, bubble, Integer(int(n)), Integer(int(kind)))
+
+            def count(self, ev):
+                r = count.invoke(None, ev)
+                return r if isinstance(r, int) else int(r.intValue())
+
+            def busy(self, ev):
+                return _b(busy.invoke(None, ev))
+
+            def when_ready(self, ev, r):
+                ready.invoke(None, ev, r)
+
+            def take(self, ev):
+                r = take.invoke(None, ev)
+                return [str(x) for x in r] if r is not None else []
+
+            def clear(self, ev):
+                clear.invoke(None, ev)
+
+            def clear_all(self):
+                clear_all.invoke(None)
+
+            def quiet(self, ev):
+                quiet.invoke(None, ev)
+        return Static()
+
+    def _r2(self, fn):
+        from android_utils import R
+        r = R(fn)
+        self._keep2 = getattr(self, "_keep2", [])[-7:] + [r]
+        return r
+
     def _r(self, fn):
         from android_utils import R
         self._keep = R(fn)
         return self._keep
 
     def on_plugin_unload(self):
+        try:
+            if self.clip is not None:
+                self.clip.getField("enabled").setBoolean(None, False)
+                disarm = self.clip.getMethod("disarmAll")
+                jclass("org.telegram.messenger.AndroidUtilities").runOnUIThread(self._r2(lambda: disarm.invoke(None)))
+        except Exception as e:
+            self._err("clip stop", e)
+        try:
+            if self.tray is not None:
+                self.tray.clear_all()
+        except Exception as e:
+            self._err("tray stop", e)
         try:
             if self.mic is not None:
                 self.mic.stop()
@@ -373,16 +592,128 @@ class VoiceSendPlugin(BasePlugin):
 
     def _apply(self, r):
         """Text that replaces the finished chunk, or None to leave it as dictated."""
-        keep, send, paste = r
+        keep, send, paste, shots = r
         if paste is None or not self.get_setting("paste", True):
-            return keep if send else None
+            return keep if send or shots else None
         clip = self._clip()
         if not clip:
-            return keep if send else None  # empty clipboard: "paste" stays as text
+            return keep if send or shots else None  # empty clipboard: "paste" stays as text
         base = _tidy(paste)
         text = (base + " " + clip) if base.strip() else (paste + clip)
         _log("spoken paste: word dropped, clipboard text inserted")
         return text
+
+    def _read(self, s, field):
+        """_parse with the screenshot command on only where it can work."""
+        on = self.tray is not None and self.get_setting("screenshot", True)
+        pic = self.tray is not None and self.get_setting("picture", True)
+        r = _parse(s, on, pic)
+        if r is not None and r[3]:
+            ev = self._outer(field)
+            if ev is None or ev.isEditingMessage() or get_private_field(ev, "parentFragment") is None:
+                r = _parse(s, False, False)
+        return r
+
+    def _shoot(self, field, kinds):
+        """Spoken "screenshot" or "picture": ask the tray of this message box for the next newest ones."""
+        ev = self._outer(field)
+        chat = get_private_field(ev, "parentFragment")
+        bubble = None
+        try:
+            bubble = get_private_field(chat, "chatInputViewsContainer")
+        except Exception:
+            pass
+        content = chat.getFragmentView()
+        i = 0
+        while i < len(kinds):
+            j = i
+            while j < len(kinds) and kinds[j] == kinds[i]:
+                j += 1
+            self.tray.add(ev, field, content, bubble, j - i, kinds[i])
+            i = j
+        _log("spoken attach: word dropped, %d screenshot, %d picture asked" % (kinds.count(0), kinds.count(1)))
+
+    def _again(self, ev):
+        try:
+            ev.sendMessage()
+        except Exception as e:
+            self._err("send again", e)
+
+    def _send_media(self, ev, notify, schedule):
+        """Send the waiting screenshots as one album, the text in the box as the caption.
+
+        The same call the app makes for picked photos. True when the box was sent this way."""
+        chat = get_private_field(ev, "parentFragment")
+        if chat is None:
+            return False
+        if not chat.checkSlowModeAlert():
+            return True  # the slow mode notice is up; the tray stays as it is
+        text = ev.getFieldText()
+        cap = str(text).strip() if text is not None else ""
+        paths = self.tray.take(ev)
+        if not paths:
+            return False
+        limit = CAPTION_MAX
+        try:
+            limit = int(chat.getMessagesController().getCaptionMaxLengthLimit())
+        except Exception:
+            pass
+        over = len(cap) > limit
+        Info = jclass("org.telegram.messenger.SendMessagesHelper$SendingMediaInfo")
+        lst = jclass("java.util.ArrayList")()
+        for i, p in enumerate(paths):
+            info = Info()
+            info.path = p
+            if i == 0 and cap and not over:
+                info.caption = cap
+                try:
+                    from java import jarray
+                    arr = jarray(jclass("java.lang.CharSequence"))([jclass("org.telegram.messenger.AndroidUtilities").getTrimmedString(text)])
+                    ents = jclass("org.telegram.messenger.MediaDataController").getInstance(chat.getCurrentAccount()).getEntities(arr, True)
+                    info.caption = str(arr[0])
+                    info.entities = ents
+                except Exception as e:
+                    self._err("caption", e)
+            lst.add(info)
+        chat.didSelectSearchPhotos(lst, notify, schedule)
+        _log("attachments sent: %d%s" % (len(paths), " with caption" if cap and not over else ""))
+        if over:
+            return False  # too long for a caption: the text follows as its own message
+        ev.setFieldText("")
+        return True
+
+    def _arm_clip(self, field):
+        try:
+            ev = self._outer(field)
+            chat = get_private_field(ev, "parentFragment") if ev is not None else None
+            if chat is None:
+                return
+            btn = ev.getAttachButton()
+            content = chat.getFragmentView()
+            if btn is None or content is None:
+                return
+            bubble = None
+            try:
+                bubble = get_private_field(chat, "chatInputViewsContainer")
+            except Exception:
+                pass
+            self.clip_arm.invoke(None, btn, ev, field, content, bubble)
+        except Exception as e:
+            self._err("arm clip", e)
+
+    def _on_clip_toggle(self, enabled):
+        try:
+            if self.clip is not None:
+                self.clip.getField("enabled").setBoolean(None, bool(enabled))
+        except Exception as e:
+            self._err("clip toggle", e)
+
+    def _on_shot_toggle(self, enabled):
+        try:
+            if not enabled and self.tray is not None:
+                self.tray.clear_all()
+        except Exception as e:
+            self._err("shot toggle", e)
 
     def _clip(self):
         """The clipboard's text, read only at the moment a spoken paste fires. Never logged."""
@@ -439,6 +770,9 @@ class VoiceSendPlugin(BasePlugin):
         if name not in self.ic_classes:
             self.ic_classes.add(name)
             self._hook_ic(cls)
+        if self.clip is not None:
+            # the paperclip is made after the message field: arm it once the box is built
+            jclass("org.telegram.messenger.AndroidUtilities").runOnUIThread(self._r2(lambda: self._arm_clip(field)))
         if not self.get_setting("enabled", True):
             return
         opts = field.getPrivateImeOptions()
@@ -518,6 +852,9 @@ class VoiceSendPlugin(BasePlugin):
         ev = self._outer(field)
         if ev is None:
             return
+        if self.tray is not None and self.tray.busy(ev):
+            self.tray.when_ready(ev, self._r2(lambda: self._send(field)))
+            return
         if ev.isEditingMessage():
             done = get_private_field(ev, "doneButton")
             if self._shown(done):
@@ -544,20 +881,160 @@ class VoiceSendPlugin(BasePlugin):
             self._err("send", e)
 
 # __DEX_BEGIN__
-# eNqFVU1sG0UUfrOzu0mcpHGclKQhCa6JRGjjOEmd1I6jiioUVYkDEpGC1Nt4d2JPst41u2uTgOjPCbgViSMneqBIFeIASKBKCA6F
-# I0IVF0BCAsSlByQQqviReDO7ia0Swcqf3/N789773sx6ns33EnNnCvDN0y+89dONe9e+uOMWfv3snSuZgY8/Mcd+//NuF0ADAPa2
-# 8imInyTaHoXInkD8hehBTBEAHeV1lL0o30OJH+jWAG4ZANMo/6AAfyMMXNiLOIYYRDyFsBGvI95GfIr4GWFi3CjiFKKIWEE8gbiA
-# uIgoIzYRTcQVxKuI64g3EO8iPkR8jfgO8QPCMAGGEGMIpAFoAlNyjHuQ/UjufYgBhGyaQvuR/XXF+kAcp/Yk1u/i4sFY/5a27T92
-# 6PdolLcnjh2K9d/kvoAGw4qXAQ/F/EaV7IETIPdTU3sqv48rqcO4khQeifmlIcpDlDRhTMlueDjOOxH7J1UvXTAS1xmE6Lzkcwxx
-# HzfmczP6beJ6+dxAjpKfhfWK2NHzqmIvME2D2+l5HfSSTmGapvRpLTU8oBMgKudNGnFrJKPseszvFtolvwJNgJ9MYNYELVIdUkMY
-# T6MqOnq7DyvVMHKHUpWDoF+DDzBHAX3jqrcKIVAgOnZ3DAR6MsTAqgauFehxkzKmjxRIVI9AghRxdWoQ65EdQsFCFMhhPVIjmsqZ
-# 0tw5DYY0mbefTsJjlMbnIM/ulOpzEQ5sdyioc+nk1I8SmZIeJSsasklTOAkpIpkJtKncBHMTmWdY5TyRJ9KKOI7K+2InCxMESuuz
-# 2b31r9Z3hBbOwGkovbK/ktVenIH4DKN3BNQOtfXo3Y3OmEyDuSJcEZ4D/Vzp8S0ga0DKcKbMXNv3hJ2rc1uw3PmmLbwN5rIq96fU
-# j2e55fm2cKurzHEqzNotwfh/BJXg9FHedhbP3RbVps9C4bklGD5c7AW5i6g7MsVop3VzPwh5fdXxZOmpsuXVc9vC50HI/JD7uZYn
-# LB5w185tCOs5Flq1EkyUbea0xG6Oua4XqlK5TVF1Wdj0eQmS5R3WYrlmKJxcWQThvy0r0H+QbVZ6gGyBtlUGulUuA7kE2qU1MJhs
-# DNJVHp63QtHiR/cYQLdwkaxrcegSwYV6I9wH02FB+IwLmufCqOc+ELlaY26V22D63OJuCJM+ryIp7h99IGCovQA9CL0GpJvu/yzv
-# azZCUecbwnFEAEaLOU0Ob5LLl58svJSRK3AzM8sZm+9lZjK43Q3hqE6ydc/mylFpVtFVY0HWqnFrN2jWg8zyNnMCPpOpCzfLGiKz
-# vLA0kwlqLDuPIazCWCW/VKws8oqdt+2FSqU4X2Fz3F7azi8unD27zRjPWwyztrgfYDEMKswuzS5kbd7KvAyaSU6O6yMw0j/SNaLh
-# vSP/yQmyRtaMa1f173Wt56ZOXrvafduQ31+aJrmvx+/+R2b7Pj+476TpFzO6ozvtUh7MOq1j3tEHZt7B3DOgPftMaM8/ko58cgbS
-# WJd3KUlGupwbWjqqJWeknu7gGuvyLqbJSJdczdgu72mI7XI2/wMT3lMD
+# eNqNfAtgnFWV/7nfvJLJJJlMmqYNbTNN0zaFpnm3aZOmSfOgaZI2TaZpkxTaSWaaTDv5ZjIzadMiEF62ICgIYnksolIExVWWoqhF
+# QVBQV5dFVFZRQVDRvygo7rK77Pb/O/feSSZpYGn7+865577Pvffcc+/3dQLBSWd5VS2ZzWfu2vCFiXuM0dP/M/rkscf/fl1T4I8f
+# ffbWa/cSRYlosq/aQ/rPmT1EDwklDwFeB9FloE+nEbWAnswi+g3oA24iF+hj+USdW4hqFxPt3YA8wHHgcuBq4CTwCPAV4HHgaeD7
+# wHPAz4BXgD8AbwB/A6iWyA5kARcAK4BKoAbYCviAvYAJjAOTwGXAlcC1wPXATcDHgU8AdwD/ANwL3Ac8CHwReBj4KnAWeBJ4BvgR
+# 8ALwC+BV4A/AG4B7I1EZsB04DHwYeAB4CngDyN5EdBGwC7gSOAM8D5wDPHVE64BmIABcAdwGPAh8C/g3wFZPtAzYBPQDY8DVwD3A
+# vwBvA0s3o//AHuAK4BRwFvgL4G5A/UAf8CHgFPA08Crwv0Axxmc7kADuBr4L/BlY1EjUCIwCNwOPAb8CLE3QO9AOjAKTwE3A54Cv
+# Az8Gfgv8B5CxlagQqAHagQAwCdwKfAn4LvBL4C0gvZmoCNgE9AAjwIeAW4DPAV8DfgC8BPwdyMKEqwYOAB8GHgaeB34G/A54F3C0
+# ov9AMVAObAS2AjuBS4Fh4BAQBRLAUeAy4ErgWuAG4BbgDuAzwAPAQ8DDwGPAN4HvAN8HngdeBH4NvA68CbwNnAOy2zDWwEKgAFgG
+# rABKgIuAMqAR8AEh4ArgOuAG4CbgDuA08DDwOPA94CfAb4DfA38Bsi8mWglsBtqAvUAUuB74PPAc8Ffgv4BzgGMbdAjkAMVAJbAJ
+# aAU6gF6gHxgCQkAcOA5cA9wE3Al8Fvg88B3g98DfgHe53HaixUAhsAJYC6wHNgNtQDewBxgGwkAcOAncBHwc+CxwBvgp8Abwn0Da
+# dugQKALWA1uB3UAM+BBwArgT+BLwGPAM8DzwC+D3wN8B6kA5wFJgNVAKrAe2ANuAXYAPGAUuA64HbgXuAj4FPAJ8B/gR8CLwK+B3
+# wNvAu4ClE+MA5ANFwIXARqAF6AYGgAPACBADjgNTwLXATcCdwGngW8CPgJ8BfwHSu4gWAMuANUA5cDHQBfQCB4DDQBSYBK4BbgXu
+# BD4NfBF4FPgJ8DsgfQfaB2wG2oFu4BJgGBgFLgduAb4AfAt4AfgV8AYgdhLlAkuBaqAVuAQIAceAjwCfAr4K/AD4BfAX4L+B9G7o
+# BvAC64A6YAewHwgCJpAAjgNXATcBtwJ3APcC9wP/CDwKfBP4AfAT4N+BRbuIVgHrgPXAFqAT6AUuAQLAYSABXAGcBD4GnALuBR4E
+# zgBPA8EerFVMlwuApcAKoAZYD+htiGDaCSacYKIJJphgagnmlGA6CWaSYP4IZk3uizABhCVKWHaE5UGYzqSnI2F4CUNCUC1BRYSu
+# EJpAaAL1Aj5gN9AHYPslbMvUDwwAg8A+4BLgUmA/cADwA0PAMBAAgsBBYAQY1Xv3IeAwEAbGABOIkNrbx4EYEAcSwARwBDjK/gBw
+# DDhOau//EHA5cAVwJTAFXAVcDVwDXAt8GDjB/gFwPfAR4Ebgo8DHgFuAjwO3AZ8Abgc+CZxiXwL4FvBd4BngWeB7wPeBxdoveaBa
+# jZXQYR4zQ/PLNP9lpPFq/jHwyzX/BPgizT+bwj+Xwr9YreaARZdZrPmXIV+p+dfBrwK16jTM21N4h+YrALhL9CbSV2r+XfDrQJ2A
+# CxOtXPOLwJdqvhj8WlB2xtbWqDLzU8pflMIvS+Ev0vyFpPJX67zNWl6t52i9lrdpeZXmW7T8Yi1fo+dwt5Z3pJTP/F7d5g6twyR/
+# QKfv0ulXa551uEbzXOZqvRZYfqHmucwk/7qW81q5VvPdWl6q184o0pfoNRStUTpgflK3wZein/4UfiClL8xfq9MPpqQ5kJxzeo3x
+# nwc1z3Ps85rn9n9B89yGhzR/I/gvav4U+H/U/H3gv6T5M+C/rPmnwT+s+edS+BdT+JdT+NfBf0Xzb6bI30nh2ZAl+bQU3p3CL0rh
+# vSl8SQpfnsLzOjqj+dr1M21oAf8NzXemyPeB/5rmA+C/ntRVSpqplPJPpvA3p/CnwD+m+XtT8j6Uwp9JSc/z/580fxbyR5N6Bv/V
+# pJ5T8r6ckvd18I8kdZsi53mYTP9uavrqmbqsG2bSvJiS3rVhJv2CFH5JCl+cknct+LOar08Z0+oNyk4O6zn5hOZ5Hj6peV5f39Y8
+# j9fTmq/fMCPfm5KG+/WU5ltS0nC/kjy3eZXeY5JrZ0SvnYv0fjOp1++orrdM853Im46//wA+A6VdKJim00WSGrRW052adoPmgt4r
+# 92YPFUhbJ+g/ide+QRsF29F1SMM21KARwXZsHy2R9sxCd0vaQa9Luor+n6Ql9Lakw/S/Wk4y31qyCCUvEWwnc+g1aS+rqVSGLbRB
+# 0mFqE+wfrKdbJHXSnZJ20acELzU73SWpoLslNegfNL1H0gb6jGC/olbm3wCP4F7B/sUmGd6ow3XY/T8r2NdokPJ65P+0YL9DhRsQ
+# 9pCid2j6KUm76D5J99FpSfPpc5IG6Iea/lZSpZcGWNA/SLqX3pBU6adB66VB64XLT5N0mFZKeoDKtLxaUkG1kvZQj063R1ILXarD
+# JyWtoI/pdJ8TvBe10f3Sh/HTp+V+6qHNgmk27ZPULamNFtCDgvfYTMqU1EUewftsPi0QvK/W0Jtyf3VSgQyvJK+kYdoi51MNcvI9
+# RS69A5oJDU9Bnq3l2RiJuAyvpwlQt5bnoL0uwXQrHZC0iT4JukDHL0C/+mU4QAOSBmlQsD9ZQHmC9+wWmS4fHtZuwfv2QrpA00bB
+# Ps0Gug60AOvgFOgS6HMTaCFavkawD1Mr8y+HPEPw2ruYfib3pkzKlWGD8iXNokIdXiGpoGJJw1Qu6Rj1ShqnPklj5NflDUl6iI5J
+# 2k6XSbqdPiR4X91JP+d9AN7jYhleREWSdlBQ8F6u9HARdtkXNR0W7Hu00b9JH0TlW6v7xfKA4PW7UeYrw0xQdAONC6aHKCbppZSQ
+# dAtNStpLV0i6m64SvN6VXip0/gqsm59LulNTg7KFovmaLpd0PUUkbaSopBvoqKaXS7qJrtTpPizYZ1PlV+r2VOr0lfCKjgslv1rL
+# r5F0PV0r7UiNvBOrgheTqelvSMn/W9IwrZLpIrRN0ih16nwhTW8SKt0d0u4oPVfDkm6XYZP2S9pMH9HxH5V2qE+mq9HlrIcdyJQu
+# gApvgF3JlOcaFa7V5dbCYjfrcEjaob1SvlGHN+l0m3S6Olj9THkestNbkjokrYcnlSlpFy2T9qpfhjfrchq0XhrgxWVKepx+JGkO
+# /Yukg/ScpHn0r5Iupucl7acfa3v1E0lb6ReS7qffSRqhP2q79mdS9fxFUhv9XdLN9C4pe/Q/klaTIdtziOySllK9pOuoRahyLpY0
+# TO1C1dOh5V2a7pB0knw6fInu30Gh2jMq6RY6Iekxulmofn5c278HBPvll0g9NGNXV7SYnELRpZKm03pNN0l6hOqk3QzT76UvfwGd
+# Fuy7LyWbpMsoR9KLaKGka2mJYB/eKsdnG8ppkOEM2iVpoczPZ9Q/yXOqIKtgH16NdwcsklvwuVWNXxdOiOdI0RtluJhuk3SVLGeH
+# zrdD92cHPPxXJC3RdI2mxfQJwX69X6brhoVLF0zHKUuwX7+C1gn241V5PTjRKjoux78Hp9Sfkor/s6RhqpTpy6lKUoOul/Qo3Sr4
+# bF1Jr8qzdYhuEHy2VuXu0fXuwelvr+DztpLv1fXs1eVz+K/y/BCm1YKpl1oFnxtUvft0vn06/T6k/5ukqvx9vKIlVfXsgyW7X/A5
+# XuU7gBWj6CF6SdIDJIQ6l+XoM9UkfKk8PqP34ezcizP5bnWe43i39sfu5DMH4n/aq8I1Wt6h/bvP8tkD8e/q+PXzxJ9FfK4+NG2Y
+# J/4FxJfr+Np54v+E+BYdv3Ge+HcR36PjN6XE36jjF+whOqjj61Lib9PxxYhP6Pj6lHMq/+H4FsTfoOM3z1P/PsTfo+MbUvR7t45P
+# IP5LiJ/azf6FgMUQ9EKFaqvHXSBuF74hD5nuf8Iccxmm+wFJPZbx8s9RheESBcZ/kel9ECPvEh7D9H5LcpxekMtaYMshs/zz5DNc
+# VrP8SVqAHF5PC9UaLuzgLSj3NNI5xUZhoRJDlGfLe45qPAW0aUNdfOfwywp1HzKM1tdiVkTdQ2inEymQK9Pj3le+ADI/QgvFWcNs
+# XEvVy7PJY822si9lkfccv61QfTfdK1Cm0+pxe0Sl1Uae8iqrg/YtX4BelGIdZkv/S+nhjQp1N+Jx+5qUDtAn9LhCeCzcq+UWl/Bt
+# RQx6xvx798wDX0vd4SyVfSuSPOPtCnVPUoRVEnX/TN5gueDf2PGX499BfBafHd18GhoU2TSI0gYtuTRoddOgLQuxmWgx38fYK9U9
+# UG1aISySCz36N5pCG2q5DXlFooocHsc1jtscpx1fcTxzxD4AzZjlL8E3NL3l8HVMbwWeWVLnrLPcSjXnimBZhgTKc/9CaiDqfQpr
+# 0HQ/K33MmPsFvsdBLSvAsx1xiUKxioYMbsHP4eO6jEKjCh7zn87VGn88x3peTjxXyplaTG8ZPBCuezmV/Fy2283eFbdDyLYU6n7t
+# xjjXwntU82Ah+TBfTPeF8hZJzgWXmgUsT86E8uVZaAHPkCzoWUg9lVSqcfVFPTTuvmM6fxb5xj3ki+WSL+4mXwI58zz2o/ZrkS/q
+# vgTrw4l605APs6vC9F4ELWTJuzB1I1dWyT4xz9NFKM8Nq1goT39+I5/OeiusZK2zopUWjxUzYkG2Vci5gPleqe7Wou4c3W9Dymsr
+# SZ4Day1OaPanPOctGy04NeQiv0XVYkVs2nRNo/C9D1kWad3xzG+sVHZrCVbVUoziQoyDFftmFoUsefBuq1HrMNKGEGO6Pcjjwkiq
+# +tT8RX05qE8cEovg7S5C/un6xKjIl2ViNMtzKdfgcjMty2i1xSLnkMAOzOdj7mcNJWU7KtWdXmqb0jFf8rB6bJgJCzBiHsEtCok8
+# 2dZMgTKFRdp+LisP/bNKHfVVqjvEQbEYK+MCrIwCvVay5DpmvV5aqfYMX+NieOxe8jUtpp6cZeTbegH5mgtovHGK3JUza264Uq25
+# QeFFmUuoHz3qtxZSv23pdNl2WbZB4Up134h5swsl9yyhnt5lsPiFKPUKWt7M2nRDP22GMHy9iPUtpfHyKynX6qKSgkxRYnOIkkWZ
+# wmEUWXZQgfUQVtfXUKLp/QZOb6b7cTkiBZbHady7HBKHcHjH5S20CzlqKNo4Sr1u03sB9vwsbVNy8PTI8yHPgEJ5f2yRFo3oSKWy
+# N4NiOfpWNN0fQ8/Fyyt5HvFdhBNrg29bfe4izIZHiHT5Kt0103NW5Rf6hvqklo/L2/Cs6Xpvmq53BeotPq/e2+aptzilXtY1j/+d
+# lSR9hyJ4U0ViI0XLx2F7CyzfBPdNcltyUtp475w28l7A4dOV6h7d510JPf8IpyOXtdC6Ddp+CPEZ5CtW8mpyWQotSm6hDMt44xfI
+# 3ey0ZFuUPrk9D1WSnOOFopkKDYxb+RFyG07B+4ih1/Ejleq+fFCsnG5LUi9fm9bLKuo3ViN+vYxPRzzneaJS3Yub7hK2PxbTvYqp
+# tWdkNV094cGe65hK2DO1LlV9z0zXV3Kenn+oy/OhvHH31dKCm+46bQMdWn7NdBu5jz+u5D0RY1p+N/rmkvuoU+rSoJ9Xqvcz2JW3
+# PnvzCcoTz219dvGJO9AyzwGLHfN8KVU3e6nNkmbUWpbQkMVBbdY0Y9z9Rda1dbzcQs02F/plQ+0uR5HVi5EsImu62QiPbIHLkeMo
+# cmSgHxmI34fjsseC/JZxrwteeU/CSj+3GcYjvurbMhCy0SO+X8AcVwdgHXpK3prJ2R+z0BAGavCYQW1pKv8kcek5winfgwn5nmKd
+# XDPr5Hun5DuXP1eq9yBDkCfnF//5q5b74FnmaNvGO8F/aB0P4ZzFO6Bb7ogN0nL25GyizdM2NVvYta/xv5XqPZWvuxFxtfCMTTe/
+# R3MaGw3sGUMeWI9K2PpF5PNVSI+j2eDZuR3pvix3BpYXWlchvIY9HOO7K0q8vt71SF+GVmyCTfH1ViNUjlCVDJVRi8UiWNJitYqH
+# m/Os1BT13ojTptN4eMXVVaa7Q7bg6qJnViRbw3ye8UQjp1upwz09dVRqWAz2ffp761D+LpxM8oypLaa3E/Y2Wwz2VOKpzuKsvcPT
+# usqvInmHeb6uYFHd9ejN9+RsY7192Z2Lsapxyz1UQH852SJZzrIqknejc8uR+5cocfhyVFm8p2ULZU8438oqtWf7vDWIX63Xg13S
+# HqzMZy3Xl497v4TyMugGrHyr3HmILqpSayLaeDv2juSasMqxrKpS7zRzsYbGy28mR7rLYbqf4XWL3cAOS/4xuhlzzxeqoqXpPQc2
+# oIWVadiV03MEe1W8DtirQvq02rQy6VVBllaYNop51WakYZ9865xvuAo9/TFmLs+RP5wrgvXBKqOo91PYC0z3Z/kWzViIxlYYhnWz
+# 8eI530gVzshpyPWvKA+1pXGNmY5l6asdufKdLo9Nr+wD66Z9zth4pSfXgDZsxD69whilHMO3vB4tGEX899k3xG4zihV3CvlzUJOy
+# 2T0o54faj4y6vy13h8XST/QYntyqDem0YsMoFVjyqcviMEpcntUrjiJsvYu6rA6jwLqIqWV5vKZyMWwHdkpbM2zEPZRnNd33YRRc
+# 1lprOqzWD6B/nDO834FFf9EwRMnrRY49qPGH6G2RUHWLuX4rZm130m81pAV3f5rPOLBIX+G911JgtaN3j2LFOFEP5t5rBVYnJGek
+# ZKO1CC1NTwkXIJyWEvYgnJESdiLsSIYttZbHz5nuz/BYwSb9I2Soufxf4EGZ3qfZI/5iEc6FUe8ERTFv/pnPDg7VE4fsiZjlgS9J
+# 8cCb5XzHHDKqh9DqLNN9r/TePUaxd1Sd0lBDPpW8kuPgPdUi/VizSr3nK6D/SNEZ/DvYZyfaNoS2Fzj/mQpsPyAuZ4BctgI7zlEF
+# VQ8hxrWAClBaia3A9RlwQqb5ELlcjmcKXP9OB9KwI6Qvo+pTXswGPrXxGb8g7VewaPk0ZS+w/xrcIjrgKLC/LGUHXAWuX4JbSE9k
+# mD2C9wpXSU6Rawexn8QnjK/TWeknubBCEnaecajt27UGn0ac6JHTVetamlz7rpqz+RTzptNnkMoDLk1r/qusedlalONizTxJJb+q
+# NQrZS3MWZDxOsk73Y4gvoMPQ3VlZ+zfooWTtTvbQviB92JjbwStAZDpnQqudafLbAiG/F1goLdCHBb/4cEpfTdDHqtS7pCU4qbNf
+# vBHWaxlG4QANOZqpKO1S1P8rpCxK3wQuDh/Bk+tZsNCGndNzJO3XKC+EPB6P6X0Z48v5+X5sxncukut7tVzbjLu0zUw9e5YilI/1
+# uUTOoqi3AJYvhH0vS77nt0nbcG+Vukth38JIWdWD3nq+8UHoORmqglfwxJX93jryeFeIAA0uL4OtAMXJb3BFDQ0Wr6fBldU0uKqC
+# au3Z8oRtlytukfDY+ITNnsHgCvZsS+R7DHWOSLXB0r9r/Ij035N+31+n/b5T0o9Rnj3RmSr1Tjxpz6am9wgntNxA0cHL6aoH1YlY
+# n3DSFxp7jW+sGVjcgNathO5d6abbCs0zXc3hNN4tmPacTCOPs+b7F5LvArXXZJAzo8eNfSsj13BS9UVYhRfgZCv6IevJ2wAt38Ra
+# ziiCNh2GI9dxm/ipOHHEfojXofcV5H/R6RQlP1O6V/vV96rUtxUxtxd9cto9tNmOHW5hiSHsu3fVEp/CN9qXT5/QensbqEIIy2ac
+# 1BaKxzLGvUHMDT7XZdO+7loasq/DmG3GajpO3cTnCDv0ta+vVvrLtuTnsVKvWSk+zk+qVPj8fdsm9S6kz6nm2UtV6h5hXHrdrunZ
+# VenOlD5VkahFHpNtM+rnM7W6cUDJ7l++741DVoq947rfPqfqLvmLbJe+R7DpE/Xvq9T3ETwmiDknx8G9gaqMBfCs4G94auR9giF3
+# BSfCGEdYgkpo505qoh7PJqo3amAN+8H5PE3wRQdzm7DiL5Jt45sxbpsh7fpy2TZDniE65UkG4/9WpqXIinMemfKcZ5UWpFpaEKuc
+# +eqcV00lL2XJOziLnNMN0jYz/99V6vuNWhvOso01cs2wTgqEQ/A9HMYB51vIvU+Ad9K+xs3yziKLdktO3nLMyndEDBlb4ZdvhfU7
+# iL66DF557OdzOePu+3mHtXk8zHEPi70j8PxcNvZB3baSvExbEaFHIix75JY96pY9It4bSPWoW88H5WO0Tp9V0qpnr9X555wxr0zy
+# 5+VX83NBtfLrkvNTnfEwR7AXJ29L5Nr2DjQ26PM8a/iCavVNmq8bvhn17NpALwoh+kF9u+BvuZ9HumWI5RXO323t7t6i7448WE9b
+# kIpHs1rOWtNbS7sg4dFYJ7n14OolB0+8pxGhGt7j8zJFgYEdRt4AjM17A8A65FuRwV2NmI0fRT+TtyLqDOJCjUvkvm2R39YJ2Z8e
+# eafNuyBrtZK/I0J631SNtGacy3dVIzz17q0ey0ZxHCuxAqW3Ie/gVdy6nVQhU+RaeVx3YA0UwW5E3WxrF1iXLVnyO9ObDWmetVGe
+# HLbBw7m6xfS6IfNdyyV0YRRkHdapRp3Cpqk9z0FSNklORzK36eumXUeKBK+5HtRSYP0C9NiH8jxvm949sq6pJtO7F1yuNQc1+MAV
+# WO8B1wvO9O6mq2TdRTacQexpW7nkUdTGtIRrKm+loMMs30YLbEWiDPXw+/whYp+uhftF9Zs2nTO9W/gtfzrfR22lWygv/V7Z1lPk
+# TC+CNYuWT9JUuultZu9oseltRBq5DqApHr9GtEHtAnzbzF5KY3JNoMQmeQeM9lnfnNabbp/B7Ws08ozGxqSk38gg39Wcv51ti/Xh
+# 28zGi8lj3T3Fc6+N9l2/Re20U3UotZRyRRV5fhPFevd68oQ60y2CvewX6XIs+O61E/POd1W1Kre8kkNTauaqFm7A7ijnibdYcuun
+# bwk2sx26dd81tUrq3Yh4npGn5Lq06NU6Wq2+JTx/f1gk7W89W0OPz92EHqSn+hCQ+HKaSHm/WdJuGqDHaKnIyT7zCr+IyvpO6QAN
+# oJasR0spgojcbJwnsGso05FVX4o/tFaF1p46U1+PZZAlLsh+uqOjvotNkcjx1N9Cw5R16vkQf9LBd+hZ/A3D2ttDh/hdZF3HutLJ
+# 0JmOQyG6iOpOdKK8E9KHyuI3all0VFdFl9PSt0r/KvI89K+CW0QvoJB6epoTPcOPV5X4d1L8qmDRy/z4liHlZ5OEZfdYZODTipyy
+# suwuK2U9he1J1vacwfS+00/9dqB+ULhzBko7iHfqWk75KS78NL0KYzTwkQ6x0D05KXIWiAXZodIB49h2uk3F38HkKZqycJ5aq+rG
+# 32Tn1naEOusH1kHRYmn2ZBn9Eyd9dPNpekC2cuCEyM9+9HMDA+dOnBIl2We6bhw4d5w+LNu09nBH6YmBV0pDA/xnUOS6nxKLc8Si
+# nPvp16xOwyUWZ23G5MmaJJ+q1IjVTd5T39GFweqiUf1Badb9A5tvP/Fj9G1dKX2CNXBaLMoufZzOclvup6dY8g2x1N1Ff5QVZ4Ve
+# Gdg8UFrfKdzuQXoBvVor8j37RImbzskunpRq/KnK/g0opz40sGzg8LrbBwY+KRa4S43xfrqWU4YmJ+snTwycGBCLswfQj/qBesQP
+# nBgc7LirHj2HWkKnOzpK7w+FJm8fODNAp+XQnr6k45hxfFR/K1uMvbFT71NJul/TPv0N7YWY70vljdPMnia0r5S8F1ylw834a8h3
+# dh2SduFvMq3Q35Za5f3zKCxXnrTzzHdJqDbZwQvNe3CKz9P5u+SXZyxTdTboMod12i5wF2uZRdMOnbeDRnQZB7WfZ+i6jOm2jeh8
+# hpZZp3m1HyV5ob8nVmX46RJoTOXrkmejZLzQ3wuL6btoda9vSJqv776VfJGmS6bfuylapOkKTYs1TX7rzN8UrdZlrpJv1piuorXy
+# K6CkfLXsS1JqT+GTfV2F0Rf6Xa3Q3w4KUt9CW+S7aNU3Q75X7pR0k6YN+r1ng9aATfL2aV2peaHmQavWa+u0NnnedemxMTRV4+/T
+# bdij6YAuawAzU+jv6VXbl+tyLLodqu7slWUtze1dZc3+sWDMX7aSBb3DsWDQjI9GEnEIRAlZStb0kbWkvX0NrSkZmhg+HEzsD4Ti
+# 0bD/2H4TGb2bvVu8O3u8+wP+hN/b2d7R6t2yhsQ6sq0bDYaGQQ5FgyNkBeFn1ByB6GhwKEpp9cPhkBlKoDn1ihoNdWRtqEOFGU2J
+# hH94dCxoJrxk3RqJhMne3NTV2tNEGc2tO3ytPfube3Z2QyjbTpnN4VB0WyQcWHfIf8RPooUyUrpGbhlI6RsZLS20oHUvCtrR1Lm/
+# eSeK3OHbv7unnUQb2bbt7GzpJYHtub2NLNx3S/v27QhBhe2dmAngtyN2O1iMcWc7WTrbEe6EHNHWTg5ZOhHEQ4Y7UWqnFHOgUwZA
+# 7J2KQjjABQ3Q8k6/GYhFQoGy4YiZQP/LmhXtCcYj4SPBWB0tfa8ku2OheB0tnj96MlFHhedFxYLxMi55IjYcnJWXh3PIHw+WNU/E
+# 4hHU6p2OGon5o6Oh4XjZ1lBizB8tRvEHQyOpmeekqKOS94pq8w8nIrFjxTujiVDEjL9PNTplHRWcn2LnRAJTKVhHxefHBWL+o/6h
+# cLCsRTN1tPZ9Ul0c8wdC0MxM6qrp1GPBQMhf1jQRCEW6/KZ/JBgrloGe4HAkFgiZI83+cHjIP3y4jpa8T6Y6umi+2JlSpD4nYn5W
+# SR3lTCc2g4kyjHGqCiJQz0QoHCjua+3pbd+5o45yZ8eZAe5DYaqw2W8OB8NhWXxvaMT0h+toUWqCVvNIKBYxefXV0YLUmG1+Li82
+# p5bOSCTKwllJu2MRTKn4nKJ7j8UTwbHmcISVdOF0TDQWORIKBGNlXayPXgx0sLh9DMqKF0tJHeVPp+WpXNYaCCXU8BTMjvDhscef
+# GB6dvVImEqFwWYuyW13BRAxjXkee2dGdkZHUjklZb+j4rDqOhIJHy7oirLrWI1I/ZbPj+vAo3mkq+9Wb8CeCzaN+cyTYGULHTW7U
+# inkzwIANH55JtHreRJ0RzI7ZCecvzReZGB6dSZR7fqI6Wnm+8OJYZCKKNXQsMpHo9sf8Y7OGb3YynE3Oj9ELsVsPZx1VnJ/GByu8
+# cygejMGYoandsSCvtZnGFr5/llQ7czQUGAmqyeCTBm7N3Kg2dCKoOjSnX8Vzk8r5JvXXO+wPB33HorNGfm6q1Omr4zrRdX9s3tqW
+# vl/aebrE3VG1FHcOR8bKDoZgqRP+WAJr5EgkhJUVNANlyV3v/VN1hYblimAz/N6perEv+mL+Y8UVxRV1tOoDpfyAJVZ+4BIrP2CJ
+# VR+4xKoPmK76A6ar+YDp1r//mCTT8QIO+MNHQofL/KYZSUijDAM8HI7EsRXAVI1GMLzL5knUbmK5NIf9cTmZz49XeeUEDKJyOQnP
+# TyU3gMREDHM9q5Odp7JQpKwtxJY1V4XDMF9l7IIF/SabgxkhLFusNzg+EcR+wvtUSoxqVv5cUWfEL82COyWCjdpsSZc/McrWeUay
+# Y2JsiPOlynYOHQoOyw1qRtYzYZpqW0hN2Qt7b0oHZa5M7p1zC/aNxoL+wOzkseDBMGqDZoK83ArmiUqOVZ6Kk9tHUwxjzKbtPcT1
+# yYpnxFDbwhRZcyTMpUtPIH9e+XkZxqIY8wT7bPPL65MjK+Xb/PHRLvbR5gp7g4l5hfVJjUthO6aWqsydIlVdniupp+wUiSw/tUt7
+# gv7D0615j4h6TPWZCHixwxOxGDuyW9mlwIjumghOBNk2z5sKVvdwMDAn7XuUqKbBtNu55v1SdWN5tE4GhyekJgrfI2loLLgbB506
+# snQ17aXMpF1WZ5YF3aFhXofxWeeU9J7W7tYm3/6uXnL0XLx1f836GvL0BMciR4Je//QZKU7O3uae1tYdvdt2+sjR29Kxv30HM604
+# 2eAkk5FaZGbS9qh6Lb6mi8nm62nq7yWrr78bJ8/dOAX1kdHXBuAc08enFjzaycbPdrJL0kYO0O3y+NLHpyKjD8ejvk5O1tku83Ti
+# wMSBThmB404fH4HaOKZTxjBxSCKLVYcho2+A0vvYVPbCVFLWNNsr2y8GyBjAYWsAhy0cmiwDfMwa4FPZIBmD7ZQ9OMeOeQbPt0y5
+# g/NYklnCpNGwyZMtWfaHAiT85PQPs1tbXF5ePs1XpPCVKXxVCl+dwteAz1B8W9g/EieLPxAgOx5N4TAtA30fB5IWyPg5bhMthJSd
+# BpU4MC13QM6OBLn9B7FUU5IgSzgcOdoMX1tNYp6fcOAoX/sim2DZY8dK/bGR0nBoLJSgwvMj4uPh0nhQWyIq/j8SsCRO3vdIFYkl
+# SnECQqPt/miUh97ij40hEOfekM3PpyQSQ5QzFDzIrU7pi2tIbVB9/vBEkOxDE0PYBShdUV8kStahifgxjkgk0FDrcDAUJsdw2I8+
+# B8g2jLwxSpOEx8DG+28QCaTRDCIG52V/yIxTRpLrCB7jeHmMRvrIBMhiTJXgfmg8GPC2tPY2r/Vi1kiOvO8Z5e1s72r3eckZwAEw
+# EOQ5S44AVmsocYzcgVCcN7S+0JA6D1I6S2Jj3EprIGIGyQhEyRGU216A0qC2+J5QYpRsaBePf1CaJXQhqO0T2Q7yJkbOg+GIP6EU
+# 5oA+d8BPQFwkNhykXEmw3o7yutuqlGYZCcpHgrLxaBqKR8IouBubtRLIIe7yx2FhyasFR4LzH2vjlMcpolGcZqRA31GQE2LtbFAm
+# +OZR7NDNUrtpHOTlS1lJTvkT5OHw7GsSWVCy0Bzwsw9/dAFErZPQEI6/fN6EV98CT00ae1mT3OkpHdy2YGhkVBXSbkYnElunJ1Uu
+# RJ0R1YF2c0/IDESOkkMKzRHZ/C5MFXU8lkUpH0EmkermRuozE7nAT1/FyNTKBJEdbLK2uach2dQ9oQDGwAqunxyjfmkHmIkmuKdg
+# 4juUBEcFLlCEyBMyt0/EEy1yym2FegNxygmxVTkYxG4VUINFrpDZ6x+LhoN8DqY0TPsEXx6QPWQeiRzG3MOC9ITiylgFA76I1oE7
+# FOdDmfRg43HolhyQjEUxo9NC2mMg66HIUJzsh4PH4AqQC+OZ6IoEQpidMIYc2mmSjWk/OcPBg9BlbCRkIipojqC/6WFYBV4tKINZ
+# 5MrEjA74RuEsmn6s7/QwhkFNcCfvmL6I1EPa2DE9JFZTznl+QuMmVCsNIdnBwmlHPKc3MPcdEXVCp4zIzCmc0iNJO0yLIuacmZ40
+# TZkRM9VSoSR5OqeFEZNH8zzdLVLylqCSt8UiYzomHWdFPRnTwKphT4eBigflhLNFsRaxstA1rN+xbXICtAWDAb6TIms0JJ8RdCyD
+# ny1BrAe0KD0aCx5pk+vegulNdjzasd7SQfUUzJpmpY9KNmm6mYQwdE5Jdpvwd8iONcQWcVksOMKDEpv/hoyyY9KJSYbjtFwJ3m/n
+# y08mmbv5LVYR8+1/ThUlt0AbvCs0NyPGKtSzyRqLRMbIEpswKTc+7SV5w5HI4YnoJi95UoSy05AtSpHxac6rdpU5qePQF5eQWuxR
+# P89+CNPQkKZwdNRPmeC2QgMjMV6FKCE1CC8fC8UdZ3MXivoiSVvB2VVcXnza9LUEUVNIXqRSthTHoIEefyA0EaeFELTNY9SdkF8c
+# 8x/hzSYLvLzfUDeust7pyc77i2zdnLsqWfI8V1M67aybKFnDzhjfr6rNTKaZfWckW9SNjZLnnQt8DysCEyghQ9N3M+RASFo6l2aU
+# QjJ0SFqsHA4oDz0WisS4k6wZeL9mXF2A9pMVIwOrzU+u0hrnjFb2RsgmD+5oERO1rVrRkyg/YZBtcojJmvDDFNoToyG4hWRLsP0h
+# RyKilkpGItIZOYqTuh8ORVoioldUYeLoOjN4ODIGz0oyIzinr9sBRpte74T5fywh1wTGeizYFQrD/JF9QjoKZD/iDxcPjZGD6XBi
+# kjKYSfoTNg6MUBoTHIECShBVJKYyxWABZYIEt19yR0ex9XMa9hUk2XlQ1jQBw+lQsxoWlJP1QNmYSkehrCbpxQUD7QG6R1xxRUvt
+# ZUXccMiKNhUFgpNFa4vYwQqpkSgdw1aEiBi8RegKkdi4SmECYR0mxuJFmw76w/Hg2qKxEPzIaKhoU+X6tUXxUX9pBTL5h/z+oer1
+# G4dqgkOB6kCgcmhoY8WQvzwYWH+wuqZyw4aDfn+wetiPUrFrxlEdMtWuW7+usjQQPFJ0OYnf3P0JMraK+yxLrPm35u/ND+ZnJYNG
+# /s35zfnZRpPxglhiaXFPUbHbjX/fNpZYli1bppKJfIuxBUzBYaMR6az0pLFMCa5VGQ2dEbmMZToqosj1iiQUuUmnLyY3/qUm/1iy
+# RZfn35A/gQZK6Z0qveDykVroxNepxA40f0N+Yf51+d/JvzLZJ1u+dbZA9TmaDFoQe+VM4KbUwHX5V+RnWewOi6tAFFjbszyC/9sK
+# P43+k1PW+2rE1VPWp2tE+pvAE+uF8Vil1ThVK4wnqi8Vz1YJcWO1EM9usJJV5DmFU2wX24evmrI+sNFIf7NWXD+Vdu0mfp6qC4gn
+# NpJFiMU3e4X8Nzo1ZX2tLiRO1pNNiCVJsfp3CJGP1R8Wr9WTIcRyKQtDdlvDmDjTQCSEidBLDVHxdgOnWCFTjEN245aYeGgLp4gj
+# NNWYEC9sQcBYebN3AoKTTUfEqUbxpPe1Rs63SuabRMR9TcfE001IKUpu9h6H4J2my8RtWx2eCxxrFgv+W8B/M5xlUkXCEB6R5AzD
+# kGEj+fdDUN29Pay6F3vESe9L2/B4diseL/cy18IcP97pFek3+yzp77SI9Jf6RPrJPSL9TxcL4+a9wrhvm7hhKu3Lu4TxQr9wnuwQ
+# zjM77MY720T6u4PCOLNPpN/HKS/FsGwXzte2Qj50nRAv7MZ49GWI+waFeKhViLOgzwGvDVqWrTprbLFahdVppfzH9XvmQz2KHutR
+# 75dPgt6r+QdBv6zjk7KvaxnzT6ak/UmK/KUU/tUU/o8p5b3Vo961W3uVLKNXyZ/UaQt6Z9Iu71WyihRZrU7fpemlmo5pelzTE70z
+# 33Ek//DvPty4m2Z9t0j6HfttkD+we7acvx+5G7Kzc+T8W3ZnIHthjpx/2+5ZyF5OqYP//GlOunGd7p056Vx9iia/rJzQ9fDv4FkR
+# V9w3uxz+bbwlkNXOkfNv5ZVrmTWlPP69Ml+f+j/9gT71/e++PvXbgeE+9dt4naA38/9h71PfbaSWyzT5e7xGym/yWmjmd3mtNPPb
+# vPyNRPL3ee008xu9wqvS8O/0WrzqNwz5/7cLt/rNNf6dAcOr6uLf8bV61bcjPGf5Px1zOfz7Azavagf/DoHFrX6fjsfXrtPw7xTw
+# xyhC/5bw/weqkUdU
 # __DEX_END__

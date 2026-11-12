@@ -1,6 +1,6 @@
-"""Builds voice_send.plugin: voice_send.src.py plus the MicWatch dex as a base64 comment block.
+"""Builds voice_send.plugin: voice_send.src.py plus the dex of the Java classes as a base64 comment block.
 
-javac -source 8 -target 8 -cp <sdk>/platforms/android-35/android.jar -d out java/com/firestarter/voicesend/MicWatch.java
+javac -source 8 -target 8 -cp <sdk>/platforms/android-35/android.jar -d out java/com/firestarter/voicesend/*.java
 d8 --min-api 26 --lib <sdk>/platforms/android-35/android.jar --output build out/com/firestarter/voicesend/*.class
 python3 build.py
 """

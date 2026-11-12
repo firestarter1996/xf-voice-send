@@ -1,6 +1,6 @@
 # 🎙️🗣️📤 Voice Send
 
-A plugin for Nagram XF. While you dictate with Gboard voice typing, say "send" and the message goes out, exactly like tapping the send button. Say "paste" and whatever you copied goes into the message box.
+A plugin for Nagram XF. While you dictate with Gboard voice typing, say "send" and the message goes out, exactly like tapping the send button. Say "paste" and whatever you copied goes into the message box. Say "screenshot" or "picture" and your newest screenshot or camera photo is attached to the message you are writing. Hold the paperclip and screenshots keep coming for as long as you hold.
 
 ## Why I made it
 
@@ -15,12 +15,22 @@ Gboard's voice typing understands "send" in Telegram, WhatsApp and a few other a
 * Saying "paste" as the last word puts your clipboard text in the message box in place of the word, without sending. Gboard sometimes writes it "past"; both count. "Paste send" pastes, then sends.
 * "Paste" stays text after "copy and", "cut and", "copy", "the", "half", "quarter", "went", "go", "goes", "going", "walked", "drove", "ran", "get", "got", "way", "long" and "far", so "copy and paste", "in the past" and "half past" are typed as words. With an empty clipboard the word stays as text too.
 * The clipboard is read only at the moment you say "paste", and its text is never logged. A second switch turns paste off.
+* Saying "screenshot" as the last word attaches your newest screenshot to the message you are writing. It waits in a small strip above the message box and nothing is sent until you send. "Screen shot" and "screenshots" count too.
+* Say "screenshot" again and the one before it is added, then the one before that, up to ten, never the same file twice. They go out together as one album, in the order you added them.
+* Whatever is in the message box goes out as the caption. "Screenshot send" attaches, then sends.
+* With screenshots waiting, the send button shows even when the box is empty, so a tap sends them too.
+* Saying "picture" does the same with the newest photo of your camera roll (DCIM/Camera, photos only, no videos). Say it again for the photo before it. "Picture send" attaches, then sends.
+* "Screenshot" and "picture" share one strip, so "screenshot", "picture", "picture" goes out as one album in the order you said them.
+* A long press on the paperclip attaches your newest screenshot without a word. Keep holding and the one before it is added about every 0.7 seconds, with a light tick each (none when vibration is off in the app), until you lift your finger. A short tap opens the attach menu as before. Stock XF does nothing on a long press of the paperclip, so nothing is lost.
+* The X on the strip removes them. The strip also empties when the message is sent, when you empty the message box by hand and when you leave the chat. After that, "screenshot" and "picture" start again from the newest.
+* "Screenshot" and "picture" stay text after "a", "the", "this", "that", "my", "your", "of", "in", "take", "send", "see", "big", "profile", "nice" and similar words, so "take a screenshot", "send me a picture", "in the picture" and "look at this screenshot" are typed as words. They also stay text in the middle of a sentence ("take a picture of it") and while you edit a message. Said on its own after a pause, the word is the command.
+* The lookup reads only the newest rows of your Screenshots folder (Pictures/Screenshots or DCIM/Screenshots) or of DCIM/Camera, and runs on a background thread. Screenshot, picture and the paperclip hold each have their own switch.
 * While you edit a message, "send" saves the edit, like the check mark.
 * In slow mode it does what tapping the timer does.
 * The Enter key still makes a new line, your Send by Enter setting stays as it is, and autocorrect and suggestions are unchanged.
 * Work happens once when a chat's message field is created, a short text check once per finished word, and once for each spoken "send". Nothing runs per letter or per frame.
 
-Settings: one switch for send, one for paste.
+Settings: one switch each for send, paste, screenshot, picture and the paperclip hold. All are on at first.
 
 ## Install
 
@@ -35,9 +45,13 @@ Gboard runs its voice "send" command only in apps on its own list (the official 
 
 Gboard does not always treat "send" as a command. Its modeless command detector (a MobileBERT intent classifier with a 0.95 threshold that also reads the text before the cursor and spoken punctuation) often scores "send" as dictation when it follows the sentence with no pause or comes right after a spoken punctuation command, and then simply types it as the last word. So the plugin also watches the message field's own InputConnection (`commitText` and `finishComposingText`, which arrive once per finished word or phrase, never per letter) for a finished chunk whose last word is "send". When that happens while voice typing is on, the word is dropped and the send button is pressed. When the field was empty a moment before (the whole message was one dictated chunk), XF is still fading the send button in, so the plugin calls the same `sendMessage` method the button calls. Voice typing counts as on while any app has the microphone open or closed it less than 3 seconds ago; a tiny Java class bundled in the plugin (`java/`, built into the plugin file by `build.py`) listens to Android's `AudioRecordingCallback`, which fires only when a recording starts or stops. Typed or swiped text never has the microphone on, so it is never taken as the command. Errors, and one line per caught "send", go to logcat under the tag `VoiceSend`.
 
+Stock XF has no place where a photo can wait in the message box. Its attach sheet is a separate window, so opening it takes the keyboard away and ends the dictation, and it forgets its ticked photos every time it opens. So spoken "screenshot" and "picture" keep their own small tray per message box (`ShotTray`, the second Java class in the plugin). One MediaStore query for the newest rows of the Screenshots or Camera folder and the thumbnail run on a background thread; the UI thread only adds the thumbnail to the strip. Every way of sending the box (the send button, Enter, spoken "send", silent and scheduled send) ends in `ChatActivityEnterView.sendMessageInternal`; a hook there sees a tray that is not empty and hands the files to `ChatActivity.didSelectSearchPhotos`, the app's own call for picked photos, with the box text as the caption of the first one. Replies, topics and slow mode behave as they do for photos picked in the attach sheet. Text too long for a caption follows the album as its own message. While the tray is empty none of its listeners exist.
+
+The paperclip hold (`ClipHold`, the third Java class) uses the button's own long press detection, then one posted repeat every 0.7 seconds while the finger is down, removed the moment it lifts. The button's click listener is untouched.
+
 ## Build
 
-`voice_send.plugin` is `voice_send.src.py` plus the compiled MicWatch class. `build.py` lists the javac and d8 steps and writes the plugin file.
+`voice_send.plugin` is `voice_send.src.py` plus the compiled Java classes (MicWatch, ShotTray and ClipHold). `build.py` lists the javac and d8 steps and writes the plugin file.
 
 ## Tested
 
@@ -50,6 +64,23 @@ Nagram XF 12.10.1 plugin build on a Pixel 6 Pro with Gboard 18.5:
 * The same chunk finished through `setComposingText` plus `finishComposingText` also sent.
 * With the microphone off, ") send" and "send" stay as typed text, and "please send" never triggers.
 * The extra hook costs about 0.15 ms per finished word.
+
+Version 1.4.0, same phone, Gboard voice typing listening, chunks replayed into the field's InputConnection, real screenshots and camera photos on the phone, in Saved Messages:
+
+* "Screenshot" into an empty box: the word was dropped, the newest screenshot showed in the strip, the send button appeared, nothing was sent.
+* "VS three in a row." then "Screenshot", "screenshot", "Screenshots." as separate chunks: three different screenshots in the strip, newest first. " send" sent them as one album with that caption.
+* "Screenshot send" as one chunk into an empty box sent the newest screenshot.
+* Text, then "screenshot", then a tap on the send button: one photo with the text as its caption.
+* "Picture" attached the newest camera photo; a tap on send sent it with its caption. "Picture send" as one chunk sent it.
+* "Screenshot", "picture", "Picture." and "screenshot picture" made one strip of five in spoken order, sent by " send" as one album of five.
+* "take a screenshot", "of the page. The screenshot shows", "Send me a screenshot", "look at this screenshot.", "my screenshots", "take a picture", "of it. In the picture", "is my profile picture" and "the big picture." all stayed text with the microphone on.
+* With the microphone off for more than 3 seconds, "Screenshot" stayed text.
+* With the screenshot and picture switches off, "Picture" and "Screenshot" stayed text.
+* The X emptied the strip. Emptying the box by hand emptied it. Leaving the chat and coming back emptied it.
+* Paperclip, real touches: a 300 ms press opened the attach menu and added nothing; a 700 ms hold added one screenshot and opened no menu; a 3 second hold added four more in order; a tap on send sent all five as one album. With its switch off, a hold only opened the menu.
+* The per word cost is unchanged from 1.3.0 (0.8 ms for 1.3.0 and for 1.4.0 in the same 300 commit run, the app's own work included).
+
+Not covered by a test: the strip with the reply bar open, slow mode, scheduled sending, a caption longer than the limit, and more than ten attachments.
 
 Version 1.3.0, same phone, same method, with a test text on the 6 Pro's clipboard:
 
