@@ -1,8 +1,8 @@
 __id__ = "voice_send"
 __name__ = "Voice Send"
-__description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Works after spoken punctuation too. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
+__description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __min_version__ = "12.5.1"
 
 # Two routes to the same tap of the send button.
@@ -15,18 +15,21 @@ __min_version__ = "12.5.1"
 #    performEditorAction(IME_ACTION_SEND), which a hook on TextView.onEditorAction answers.
 #
 # 2. The typed word. Gboard's modeless command detector (SmartEdit, a MobileBERT intent classifier
-#    with a 0.95 threshold that also reads the text before the cursor and spoken punctuation) does
-#    not always call "send" a command: right after a spoken punctuation command such as "close
-#    parenthesis" it scores it as dictation and types the word instead. So the message field's own
-#    InputConnection is watched for the moment Gboard finalizes a voice chunk that is nothing but
-#    "send" (commitText, or finishComposingText over a composing region), optionally led by the
-#    punctuation Gboard just typed. If the microphone is recording at that moment (voice typing is
-#    on) the word is dropped and the send button is pressed. Typed or swiped text never counts (no
-#    microphone), and neither does "send" inside a longer phrase ("please send it").
+#    with a 0.95 threshold that also reads the text before the cursor and spoken punctuation) often
+#    does not call "send" a command: when it is said straight after the sentence with no pause, or
+#    right after a spoken punctuation command such as "close parenthesis", it is finalized as the
+#    last word of the dictated text and typed. So the message field's own InputConnection is watched
+#    for the moment Gboard finalizes a chunk (commitText, or finishComposingText over a composing
+#    region) whose LAST word is "send" (any case, punctuation or spaces after it allowed). If voice
+#    typing is on (any app has the microphone open, or closed it less than 3 seconds ago, tracked by
+#    an event driven AudioRecordingCallback) the word is dropped and the send button is pressed.
+#    Whatever word comes before it. Not a command: typed or swiped text (no microphone), "send" in
+#    the middle of a chunk ("send it to Tim") and longer words ("resend").
 #
 # Cost: one Python call per commitText and finishComposingText of the message field (once per word,
-# never per letter: letters go through setComposingText, which is not hooked) and a short string
-# test; the microphone check runs only when that test matches. Nothing per frame, no polling.
+# never per letter: letters go through setComposingText, which is not hooked) and a string test on
+# the end of the chunk; no binder call, nothing per frame, no polling. The microphone state comes
+# from Android's recording callback, which fires only when a recording starts or stops.
 # Logcat tag VoiceSend: errors, one line per spoken send the plugin catches, and a call trace when
 # files/voice_send_debug exists at load.
 
@@ -40,9 +43,9 @@ from ui.settings import Header, Switch
 TOKEN = "handlesSendAction"
 IME_ACTION_SEND = 4
 GUARD_MS = 1500
-# A finalized voice chunk that is only the command: optional punctuation Gboard typed for a spoken
-# punctuation command, then "send", then at most a period or exclamation mark Gboard may add.
-SEND_CHUNK = re.compile(r"^(\s*[^\w\s]*)\s*send[.!]?\s*$", re.IGNORECASE)
+VOICE_GRACE_MS = 3000
+MICWATCH = "com.firestarter.voicesend.MicWatch"
+_TRAIL = " \t\n.!?"
 
 
 def _log(msg):
@@ -58,13 +61,19 @@ def _without(opts):
 
 
 def _maybe_send(s):
-    """Cheap test first: a short chunk containing 'end'. Returns the prefix to keep, or None."""
-    if s is None or len(s) > 12:
+    """If the chunk's last word is the command "send", return the text to keep in its place."""
+    if not s:
         return None
-    if "end" not in s.lower():
+    t = s.rstrip(_TRAIL)
+    if len(t) < 4 or t[-4:].lower() != "send":
         return None
-    m = SEND_CHUNK.match(s)
-    return m.group(1).rstrip() if m else None
+    head = t[:-4]
+    if head and (head[-1].isalnum() or head[-1] in "'\u2019_-"):
+        return None  # part of a longer word: resend, godsend
+    keep = head.rstrip()
+    if keep.endswith(","):
+        keep = keep[:-1].rstrip()
+    return keep
 
 
 class VoiceSendPlugin(BasePlugin):
@@ -104,6 +113,13 @@ class VoiceSendPlugin(BasePlugin):
         except Exception as e:
             self.audio = None
             self._err("audio", e)
+        self.mic = None
+        try:
+            self.mic = self._load_micwatch(ctx)
+            self.mic.start(self.audio)
+        except Exception as e:
+            self.mic = None
+            self._err("micwatch", e)
 
         class CreateHook(MethodHook):
             def after_hooked_method(self, param):
@@ -149,6 +165,8 @@ class VoiceSendPlugin(BasePlugin):
                     s = str(s) if s is not None else None
                     if plugin.debug:
                         plugin._trace("commit", s, field)
+                    if not s or "end" not in s[-8:].lower():
+                        return
                     keep = _maybe_send(s)
                     if keep is None or not plugin.get_setting("enabled", True):
                         return
@@ -173,9 +191,10 @@ class VoiceSendPlugin(BasePlugin):
                     b = plugin.BIC.getComposingSpanEnd(ed)
                     if a < 0 or b <= a:
                         return
-                    if b - a > 12:
+                    s = str(ed.subSequence(max(a, b - 8), b))
+                    if "end" not in s.lower():
                         if plugin.debug:
-                            plugin._trace("finish", "<%d chars>" % (b - a), field)
+                            plugin._trace("finish", s, field)
                         return
                     s = str(ed.subSequence(a, b))
                     if plugin.debug:
@@ -227,12 +246,49 @@ class VoiceSendPlugin(BasePlugin):
         AU.runOnUIThread(self._r(self._prep_open))
         _log("loaded %s%s" % (__version__, " debug" if self.debug else ""))
 
+    def _load_micwatch(self, ctx):
+        """The tiny MicWatch class ships as a dex inside this file (see the end of the file)."""
+        import base64
+        import zlib
+        with open(__file__, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        block = text.rsplit("# __DEX_BEGIN__", 1)[1].split("# __DEX_END__", 1)[0]
+        payload = "".join(l.strip()[1:].strip() for l in block.splitlines() if l.strip().startswith("#"))
+        data = zlib.decompress(base64.b64decode(payload))
+        Loader = jclass("dalvik.system.InMemoryDexClassLoader")
+        self.loader = Loader(jclass("java.nio.ByteBuffer").wrap(data), ctx.getClassLoader())
+        return self._static(self.loader.loadClass(MICWATCH))
+
+    def _static(self, cls):
+        """Wrap a java.lang.Class so its static methods can be called from Python."""
+        AM = jclass("android.media.AudioManager")
+        start = cls.getMethod("start", AM)
+        stop = cls.getMethod("stop")
+        recent = cls.getMethod("recent", jclass("java.lang.Long").TYPE)
+
+        class Static:
+            def start(self, am):
+                start.invoke(None, am)
+
+            def stop(self):
+                stop.invoke(None)
+
+            def recent(self, ms):
+                r = recent.invoke(None, jclass("java.lang.Long")(int(ms)))
+                return r if isinstance(r, bool) else bool(r.booleanValue())
+        return Static()
+
     def _r(self, fn):
         from android_utils import R
         self._keep = R(fn)
         return self._keep
 
     def on_plugin_unload(self):
+        try:
+            if self.mic is not None:
+                self.mic.stop()
+        except Exception as e:
+            self._err("micwatch stop", e)
         try:
             for f in list(self.fields.keySet().toArray()):
                 if f is not None:
@@ -247,15 +303,17 @@ class VoiceSendPlugin(BasePlugin):
 
     def _trace(self, what, s, field):
         if s is not None and len(s) > 20:
-            s = "<%d chars>" % len(s)
+            s = "<%d chars>...%s" % (len(s), s[-10:])
         _log("trace %s %r mic=%s" % (what, s, self._mic_on()))
 
     def _recent(self):
         return self.fired and self.SystemClock.uptimeMillis() - self.fired < GUARD_MS
 
     def _mic_on(self):
-        """Is any app recording right now (Gboard voice typing)? Runs only for a matching chunk."""
+        """Is voice typing on: the microphone open now or closed under VOICE_GRACE_MS ago?"""
         try:
+            if self.mic is not None:
+                return bool(self.mic.recent(VOICE_GRACE_MS))
             return self.audio is not None and not self.audio.getActiveRecordingConfigurations().isEmpty()
         except Exception as e:
             self._err("mic", e)
@@ -379,3 +437,32 @@ class VoiceSendPlugin(BasePlugin):
         slow = get_private_field(ev, "slowModeButton")
         if self._shown(slow):
             slow.performClick()
+            return
+        # The field was empty a moment ago: the send button is still fading in, so call the
+        # same method the button calls.
+        try:
+            m = self.caev.getDeclaredMethod("sendMessage")
+            m.setAccessible(True)
+            m.invoke(ev)
+            _log("send button still appearing, sent through sendMessage")
+        except Exception as e:
+            self._err("send", e)
+
+# __DEX_BEGIN__
+# eNqFVU1sG0UUfrOzu0mcpHGclKQhCa6JRGjjOEmd1I6jiioUVYkDEpGC1Nt4d2JPst41u2uTgOjPCbgViSMneqBIFeIASKBKCA6F
+# I0IVF0BCAsSlByQQqviReDO7ia0Swcqf3/N789773sx6ns33EnNnCvDN0y+89dONe9e+uOMWfv3snSuZgY8/Mcd+//NuF0ADAPa2
+# 8imInyTaHoXInkD8hehBTBEAHeV1lL0o30OJH+jWAG4ZANMo/6AAfyMMXNiLOIYYRDyFsBGvI95GfIr4GWFi3CjiFKKIWEE8gbiA
+# uIgoIzYRTcQVxKuI64g3EO8iPkR8jfgO8QPCMAGGEGMIpAFoAlNyjHuQ/UjufYgBhGyaQvuR/XXF+kAcp/Yk1u/i4sFY/5a27T92
+# 6PdolLcnjh2K9d/kvoAGw4qXAQ/F/EaV7IETIPdTU3sqv48rqcO4khQeifmlIcpDlDRhTMlueDjOOxH7J1UvXTAS1xmE6Lzkcwxx
+# HzfmczP6beJ6+dxAjpKfhfWK2NHzqmIvME2D2+l5HfSSTmGapvRpLTU8oBMgKudNGnFrJKPseszvFtolvwJNgJ9MYNYELVIdUkMY
+# T6MqOnq7DyvVMHKHUpWDoF+DDzBHAX3jqrcKIVAgOnZ3DAR6MsTAqgauFehxkzKmjxRIVI9AghRxdWoQ65EdQsFCFMhhPVIjmsqZ
+# 0tw5DYY0mbefTsJjlMbnIM/ulOpzEQ5sdyioc+nk1I8SmZIeJSsasklTOAkpIpkJtKncBHMTmWdY5TyRJ9KKOI7K+2InCxMESuuz
+# 2b31r9Z3hBbOwGkovbK/ktVenIH4DKN3BNQOtfXo3Y3OmEyDuSJcEZ4D/Vzp8S0ga0DKcKbMXNv3hJ2rc1uw3PmmLbwN5rIq96fU
+# j2e55fm2cKurzHEqzNotwfh/BJXg9FHedhbP3RbVps9C4bklGD5c7AW5i6g7MsVop3VzPwh5fdXxZOmpsuXVc9vC50HI/JD7uZYn
+# LB5w185tCOs5Flq1EkyUbea0xG6Oua4XqlK5TVF1Wdj0eQmS5R3WYrlmKJxcWQThvy0r0H+QbVZ6gGyBtlUGulUuA7kE2qU1MJhs
+# DNJVHp63QtHiR/cYQLdwkaxrcegSwYV6I9wH02FB+IwLmufCqOc+ELlaY26V22D63OJuCJM+ryIp7h99IGCovQA9CL0GpJvu/yzv
+# azZCUecbwnFEAEaLOU0Ob5LLl58svJSRK3AzM8sZm+9lZjK43Q3hqE6ydc/mylFpVtFVY0HWqnFrN2jWg8zyNnMCPpOpCzfLGiKz
+# vLA0kwlqLDuPIazCWCW/VKws8oqdt+2FSqU4X2Fz3F7azi8unD27zRjPWwyztrgfYDEMKswuzS5kbd7KvAyaSU6O6yMw0j/SNaLh
+# vSP/yQmyRtaMa1f173Wt56ZOXrvafduQ31+aJrmvx+/+R2b7Pj+476TpFzO6ozvtUh7MOq1j3tEHZt7B3DOgPftMaM8/ko58cgbS
+# WJd3KUlGupwbWjqqJWeknu7gGuvyLqbJSJdczdgu72mI7XI2/wMT3lMD
+# __DEX_END__

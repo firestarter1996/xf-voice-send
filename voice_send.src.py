@@ -1,0 +1,449 @@
+__id__ = "voice_send"
+__name__ = "Voice Send"
+__description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
+__author__ = "firestarter1996"
+__version__ = "1.2.0"
+__min_version__ = "12.5.1"
+
+# Two routes to the same tap of the send button.
+#
+# 1. Gboard's own command. Gboard runs its voice "send" command (SendPerformer) only in an app on
+#    its built in list or in a field that says it takes a send action (imeOptions action SEND, or
+#    the private IME option "handlesSendAction"). The plugin adds only "handlesSendAction" to the
+#    chat message field; imeOptions stay untouched, so the Enter key, Send by Enter, autocorrect and
+#    suggestions are unchanged. When Gboard decides "send" is a command it calls
+#    performEditorAction(IME_ACTION_SEND), which a hook on TextView.onEditorAction answers.
+#
+# 2. The typed word. Gboard's modeless command detector (SmartEdit, a MobileBERT intent classifier
+#    with a 0.95 threshold that also reads the text before the cursor and spoken punctuation) often
+#    does not call "send" a command: when it is said straight after the sentence with no pause, or
+#    right after a spoken punctuation command such as "close parenthesis", it is finalized as the
+#    last word of the dictated text and typed. So the message field's own InputConnection is watched
+#    for the moment Gboard finalizes a chunk (commitText, or finishComposingText over a composing
+#    region) whose LAST word is "send" (any case, punctuation or spaces after it allowed). If voice
+#    typing is on (any app has the microphone open, or closed it less than 3 seconds ago, tracked by
+#    an event driven AudioRecordingCallback) the word is dropped and the send button is pressed.
+#    Whatever word comes before it. Not a command: typed or swiped text (no microphone), "send" in
+#    the middle of a chunk ("send it to Tim") and longer words ("resend").
+#
+# Cost: one Python call per commitText and finishComposingText of the message field (once per word,
+# never per letter: letters go through setComposingText, which is not hooked) and a string test on
+# the end of the chunk; no binder call, nothing per frame, no polling. The microphone state comes
+# from Android's recording callback, which fires only when a recording starts or stops.
+# Logcat tag VoiceSend: errors, one line per spoken send the plugin catches, and a call trace when
+# files/voice_send_debug exists at load.
+
+import re
+from java import jclass
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from client_utils import get_last_fragment
+from ui.settings import Header, Switch
+
+TOKEN = "handlesSendAction"
+IME_ACTION_SEND = 4
+GUARD_MS = 1500
+VOICE_GRACE_MS = 3000
+MICWATCH = "com.firestarter.voicesend.MicWatch"
+_TRAIL = " \t\n.!?"
+
+
+def _log(msg):
+    try:
+        jclass("android.util.Log").i("VoiceSend", str(msg))
+    except Exception:
+        pass
+
+
+def _without(opts):
+    parts = [p for p in str(opts or "").replace(";", ",").split(",") if p and p.strip() != TOKEN]
+    return ",".join(parts) if parts else None
+
+
+def _maybe_send(s):
+    """If the chunk's last word is the command "send", return the text to keep in its place."""
+    if not s:
+        return None
+    t = s.rstrip(_TRAIL)
+    if len(t) < 4 or t[-4:].lower() != "send":
+        return None
+    head = t[:-4]
+    if head and (head[-1].isalnum() or head[-1] in "'\u2019_-"):
+        return None  # part of a longer word: resend, godsend
+    keep = head.rstrip()
+    if keep.endswith(","):
+        keep = keep[:-1].rstrip()
+    return keep
+
+
+class VoiceSendPlugin(BasePlugin):
+
+    def create_settings(self):
+        return [
+            Header(text="Voice Send"),
+            Switch(key="enabled", text="Say \"send\" to send", default=True,
+                   subtext="While dictating with Gboard voice typing, saying send sends the message like the send button.",
+                   on_change=self._on_toggle),
+        ]
+
+    def on_plugin_load(self):
+        self.errors = 0
+        self.fired = 0
+        self.debug = False
+        WeakHashMap = jclass("java.util.WeakHashMap")
+        Collections = jclass("java.util.Collections")
+        self.fields = Collections.synchronizedMap(WeakHashMap())
+        self.ics = Collections.synchronizedMap(WeakHashMap())
+        self.VISIBLE = 0
+        self.SystemClock = jclass("android.os.SystemClock")
+        self.BIC = jclass("android.view.inputmethod.BaseInputConnection")
+        caev = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+        tv = find_class("android.widget.TextView")
+        icw = find_class("android.view.inputmethod.InputConnectionWrapper")
+        if caev is None or tv is None or icw is None:
+            _log("classes not found")
+            return
+        self.caev = caev
+        plugin = self
+        try:
+            import os
+            ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+            self.audio = ctx.getSystemService("audio")
+            self.debug = os.path.exists(os.path.join(str(ctx.getFilesDir().getAbsolutePath()), "voice_send_debug"))
+        except Exception as e:
+            self.audio = None
+            self._err("audio", e)
+        self.mic = None
+        try:
+            self.mic = self._load_micwatch(ctx)
+            self.mic.start(self.audio)
+        except Exception as e:
+            self.mic = None
+            self._err("micwatch", e)
+
+        class CreateHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plugin._prep(get_private_field(param.thisObject, "messageEditText"))
+                except Exception as e:
+                    plugin._err("create", e)
+
+        class ActionHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    if int(param.args[0]) != IME_ACTION_SEND or not plugin.fields.containsKey(param.thisObject):
+                        return
+                    if not plugin.get_setting("enabled", True):
+                        return
+                    if plugin._recent():
+                        param.setResult(True)
+                        return
+                    plugin._send(param.thisObject)
+                    param.setResult(True)
+                except Exception as e:
+                    plugin._err("send", e)
+
+        class IcHook(MethodHook):
+            """The message field's onCreateInputConnection: remember the connection it hands out."""
+            def after_hooked_method(self, param):
+                try:
+                    ic = param.getResult()
+                    if plugin.debug:
+                        _log("trace ic %s known=%s" % (ic.getClass().getName() if ic is not None else None, plugin.fields.containsKey(param.thisObject)))
+                    if ic is not None and plugin.fields.containsKey(param.thisObject):
+                        plugin.ics.put(ic, param.thisObject)
+                except Exception as e:
+                    plugin._err("ic", e)
+
+        class CommitHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    field = plugin.ics.get(param.thisObject)
+                    if field is None:
+                        return
+                    s = param.args[0]
+                    s = str(s) if s is not None else None
+                    if plugin.debug:
+                        plugin._trace("commit", s, field)
+                    if not s or "end" not in s[-8:].lower():
+                        return
+                    keep = _maybe_send(s)
+                    if keep is None or not plugin.get_setting("enabled", True):
+                        return
+                    if plugin._recent():
+                        param.args[0] = keep
+                        return
+                    if not plugin._mic_on():
+                        return
+                    param.args[0] = keep
+                    plugin._fire(field)
+                except Exception as e:
+                    plugin._err("commit", e)
+
+        class FinishHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    field = plugin.ics.get(param.thisObject)
+                    if field is None:
+                        return
+                    ed = field.getText()
+                    a = plugin.BIC.getComposingSpanStart(ed)
+                    b = plugin.BIC.getComposingSpanEnd(ed)
+                    if a < 0 or b <= a:
+                        return
+                    s = str(ed.subSequence(max(a, b - 8), b))
+                    if "end" not in s.lower():
+                        if plugin.debug:
+                            plugin._trace("finish", s, field)
+                        return
+                    s = str(ed.subSequence(a, b))
+                    if plugin.debug:
+                        plugin._trace("finish", s, field)
+                    keep = _maybe_send(s)
+                    if keep is None or not plugin.get_setting("enabled", True):
+                        return
+                    if not plugin._recent() and not plugin._mic_on():
+                        return
+                    ed.replace(a, b, keep)
+                    if not plugin._recent():
+                        plugin._fire(field)
+                except Exception as e:
+                    plugin._err("finish", e)
+
+        class ComposeTrace(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    field = plugin.ics.get(param.thisObject)
+                    if field is not None:
+                        s = param.args[0]
+                        plugin._trace("compose", str(s) if s is not None else None, field)
+                except Exception as e:
+                    plugin._err("trace", e)
+
+        create = None
+        for m in caev.getDeclaredMethods():
+            if m.getName() == "createMessageEditText" and len(m.getParameterTypes()) == 0:
+                create = m
+        if create is None:
+            _log("createMessageEditText not found")
+            return
+        CS = jclass("java.lang.CharSequence")
+        INT = jclass("java.lang.Integer").TYPE
+        self.ic_hook = IcHook()
+        self.ic_classes = set()
+        self.hook_method(create, CreateHook())
+        self.hook_method(tv.getDeclaredMethod("onEditorAction", INT), ActionHook())
+        # The keyboard talks to the field through the androidx InputConnectionCompat wrapper that the
+        # field's own onCreateInputConnection returns (a subclass of the framework
+        # InputConnectionWrapper). Calls into it arrive by interface dispatch, so hooks on
+        # InputConnectionWrapper see every one of them; a hook on BaseInputConnection would not,
+        # because EditableInputConnection reaches it by a direct super call inside the boot image.
+        self.hook_method(icw.getDeclaredMethod("commitText", CS, INT), CommitHook())
+        self.hook_method(icw.getDeclaredMethod("finishComposingText"), FinishHook())
+        if self.debug:
+            self.hook_method(icw.getDeclaredMethod("setComposingText", CS, INT), ComposeTrace())
+        AU = jclass("org.telegram.messenger.AndroidUtilities")
+        AU.runOnUIThread(self._r(self._prep_open))
+        _log("loaded %s%s" % (__version__, " debug" if self.debug else ""))
+
+    def _load_micwatch(self, ctx):
+        """The tiny MicWatch class ships as a dex inside this file (see the end of the file)."""
+        import base64
+        import zlib
+        with open(__file__, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        block = text.rsplit("# __DEX_BEGIN__", 1)[1].split("# __DEX_END__", 1)[0]
+        payload = "".join(l.strip()[1:].strip() for l in block.splitlines() if l.strip().startswith("#"))
+        data = zlib.decompress(base64.b64decode(payload))
+        Loader = jclass("dalvik.system.InMemoryDexClassLoader")
+        self.loader = Loader(jclass("java.nio.ByteBuffer").wrap(data), ctx.getClassLoader())
+        return self._static(self.loader.loadClass(MICWATCH))
+
+    def _static(self, cls):
+        """Wrap a java.lang.Class so its static methods can be called from Python."""
+        AM = jclass("android.media.AudioManager")
+        start = cls.getMethod("start", AM)
+        stop = cls.getMethod("stop")
+        recent = cls.getMethod("recent", jclass("java.lang.Long").TYPE)
+
+        class Static:
+            def start(self, am):
+                start.invoke(None, am)
+
+            def stop(self):
+                stop.invoke(None)
+
+            def recent(self, ms):
+                r = recent.invoke(None, jclass("java.lang.Long")(int(ms)))
+                return r if isinstance(r, bool) else bool(r.booleanValue())
+        return Static()
+
+    def _r(self, fn):
+        from android_utils import R
+        self._keep = R(fn)
+        return self._keep
+
+    def on_plugin_unload(self):
+        try:
+            if self.mic is not None:
+                self.mic.stop()
+        except Exception as e:
+            self._err("micwatch stop", e)
+        try:
+            for f in list(self.fields.keySet().toArray()):
+                if f is not None:
+                    f.setPrivateImeOptions(_without(f.getPrivateImeOptions()))
+        except Exception as e:
+            self._err("unload", e)
+
+    def _err(self, where, e):
+        if self.errors < 5:
+            self.errors += 1
+            _log("%s: %s" % (where, e))
+
+    def _trace(self, what, s, field):
+        if s is not None and len(s) > 20:
+            s = "<%d chars>...%s" % (len(s), s[-10:])
+        _log("trace %s %r mic=%s" % (what, s, self._mic_on()))
+
+    def _recent(self):
+        return self.fired and self.SystemClock.uptimeMillis() - self.fired < GUARD_MS
+
+    def _mic_on(self):
+        """Is voice typing on: the microphone open now or closed under VOICE_GRACE_MS ago?"""
+        try:
+            if self.mic is not None:
+                return bool(self.mic.recent(VOICE_GRACE_MS))
+            return self.audio is not None and not self.audio.getActiveRecordingConfigurations().isEmpty()
+        except Exception as e:
+            self._err("mic", e)
+            return False
+
+    def _fire(self, field):
+        """Press send once the keyboard's current call has applied (the word is already dropped)."""
+        self.fired = self.SystemClock.uptimeMillis()
+        _log("spoken send: word dropped, pressing send")
+        plugin = self
+
+        def go():
+            try:
+                plugin._send(field)
+            except Exception as e:
+                plugin._err("fire", e)
+        from android_utils import R
+        self._fire_r = R(go)
+        jclass("org.telegram.messenger.AndroidUtilities").runOnUIThread(self._fire_r)
+
+    def _prep(self, field):
+        """Once per message field: tell the keyboard this field takes a send action."""
+        if field is None:
+            return
+        self.fields.put(field, True)
+        cls = field.getClass()
+        name = str(cls.getName())
+        if name not in self.ic_classes:
+            self.ic_classes.add(name)
+            self._hook_ic(cls)
+        if not self.get_setting("enabled", True):
+            return
+        opts = field.getPrivateImeOptions()
+        cur = str(opts) if opts is not None else ""
+        if TOKEN not in cur.replace(";", ",").split(","):
+            field.setPrivateImeOptions(TOKEN if not cur else cur + "," + TOKEN)
+        if field.hasFocus():
+            imm = field.getContext().getSystemService("input_method")
+            if imm is not None:
+                imm.restartInput(field)
+
+    def _hook_ic(self, cls):
+        """Hook the nearest app override of onCreateInputConnection (the one that wraps the connection)."""
+        EI = jclass("android.view.inputmethod.EditorInfo")
+        c = cls
+        while c is not None and not str(c.getName()).startswith("android."):
+            try:
+                m = c.getDeclaredMethod("onCreateInputConnection", EI)
+                key = str(c.getName()) + "#ic"
+                if key not in self.ic_classes:
+                    self.ic_classes.add(key)
+                    self.hook_method(m, self.ic_hook)
+                return
+            except Exception:
+                c = c.getSuperclass()
+        _log("onCreateInputConnection not found for %s" % cls.getName())
+
+    def _prep_open(self):
+        """At load: the chats already open get the option too."""
+        try:
+            f = get_last_fragment()
+            stack = f.getParentLayout().getFragmentStack() if f is not None else None
+            if stack is None:
+                return
+            for i in range(stack.size()):
+                ev = get_private_field(stack.get(i), "chatActivityEnterView")
+                if ev is not None:
+                    self._prep(get_private_field(ev, "messageEditText"))
+        except Exception as e:
+            self._err("open chats", e)
+
+    def _on_toggle(self, enabled):
+        try:
+            for f in list(self.fields.keySet().toArray()):
+                if f is None:
+                    continue
+                if enabled:
+                    self._prep(f)
+                else:
+                    f.setPrivateImeOptions(_without(f.getPrivateImeOptions()))
+                    if f.hasFocus():
+                        imm = f.getContext().getSystemService("input_method")
+                        if imm is not None:
+                            imm.restartInput(f)
+        except Exception as e:
+            self._err("toggle", e)
+
+    def _outer(self, field):
+        c = field.getClass()
+        while c is not None:
+            try:
+                fl = c.getDeclaredField("this$0")
+                fl.setAccessible(True)
+                v = fl.get(field)
+                if self.caev.isInstance(v):
+                    return v
+            except Exception:
+                pass
+            c = c.getSuperclass()
+        return None
+
+    def _shown(self, v):
+        return v is not None and v.getVisibility() == self.VISIBLE and v.isShown() and float(v.getAlpha()) > 0.5
+
+    def _send(self, field):
+        """Press the button a finger would press now."""
+        ev = self._outer(field)
+        if ev is None:
+            return
+        if ev.isEditingMessage():
+            done = get_private_field(ev, "doneButton")
+            if self._shown(done):
+                done.performClick()
+            else:
+                ev.doneEditingMessage()
+            return
+        sb = ev.getSendButtonInternal()
+        if self._shown(sb) and sb.isEnabled():
+            sb.performClick()
+            return
+        slow = get_private_field(ev, "slowModeButton")
+        if self._shown(slow):
+            slow.performClick()
+            return
+        # The field was empty a moment ago: the send button is still fading in, so call the
+        # same method the button calls.
+        try:
+            m = self.caev.getDeclaredMethod("sendMessage")
+            m.setAccessible(True)
+            m.invoke(ev)
+            _log("send button still appearing, sent through sendMessage")
+        except Exception as e:
+            self._err("send", e)
