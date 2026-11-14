@@ -2,7 +2,7 @@ __id__ = "voice_send"
 __name__ = "Voice Send"
 __description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Say \"paste\" and the clipboard text goes in. Say \"screenshot\" or \"picture\" and your newest screenshot or camera photo is attached, say it again for the one before. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 __min_version__ = "12.5.1"
 
 # Two routes to the same tap of the send button.
@@ -46,6 +46,12 @@ __min_version__ = "12.5.1"
 #    every time it opens. So the tray is the plugin's own (ShotTray, Java, in the dex below).
 #    The lookup (one MediaStore query for the newest rows) and the thumbnail run on a background
 #    thread. While the tray is empty nothing of it is registered.
+#    A screenshot or photo taken a moment ago is still being written for a second or more (its row
+#    is "pending" and hidden from a normal query), so 1.4.0 took the one before it. Since 1.4.1 the
+#    same query includes rows still being written; when the newest one not in the tray is such a
+#    row (added in the last minute), the background thread checks it every 0.1 s until it is
+#    finished, then takes it (8 s at most, then the one before as before; stops when the chat is
+#    left). Nothing pending: no extra query, no wait.
 #
 # 5. Spoken "picture". Exactly like "screenshot", for the newest photo of the camera roll
 #    (DCIM/Camera, pictures only, no videos). Both kinds share one tray, so "screenshot", "picture",

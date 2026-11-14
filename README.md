@@ -25,6 +25,7 @@ Gboard's voice typing understands "send" in Telegram, WhatsApp and a few other a
 * The X on the strip removes them. The strip also empties when the message is sent, when you empty the message box by hand and when you leave the chat. After that, "screenshot" and "picture" start again from the newest.
 * "Screenshot" and "picture" stay text after "a", "the", "this", "that", "my", "your", "of", "in", "take", "send", "see", "big", "profile", "nice" and similar words, so "take a screenshot", "send me a picture", "in the picture" and "look at this screenshot" are typed as words. They also stay text in the middle of a sentence ("take a picture of it") and while you edit a message. Said on its own after a pause, the word is the command.
 * The lookup reads only the newest rows of your Screenshots folder (Pictures/Screenshots or DCIM/Screenshots) or of DCIM/Camera, and runs on a background thread. Screenshot, picture and the paperclip hold each have their own switch.
+* A screenshot or photo you took a second ago is the one you get. Android takes a moment to finish saving a new screenshot (on a Pixel 6 Pro up to about a second, longer for a big one) and hides it while it does, so 1.4.0 could attach the one before it. Since 1.4.1 the lookup sees a picture that is still being saved, waits on its background thread until it is finished (checking every 0.1 second, at most 8 seconds) and attaches it. With nothing being saved there is no wait and no extra work.
 * While you edit a message, "send" saves the edit, like the check mark.
 * In slow mode it does what tapping the timer does.
 * The Enter key still makes a new line, your Send by Enter setting stays as it is, and autocorrect and suggestions are unchanged.
@@ -64,6 +65,18 @@ Nagram XF 12.10.1 plugin build on a Pixel 6 Pro with Gboard 18.5:
 * The same chunk finished through `setComposingText` plus `finishComposingText` also sent.
 * With the microphone off, ") send" and "send" stay as typed text, and "please send" never triggers.
 * The extra hook costs about 0.15 ms per finished word.
+
+Version 1.4.1, Pixel 6 Pro test phone, real screenshots taken with the screenshot key, in Saved Messages:
+
+* Before the fix (1.4.0): a screenshot, then a paperclip hold 0.2 to 0.4 seconds later, attached the screenshot before it in 6 of 6 tries. The new screenshot was still being saved at that moment (its file was named .pending and its MediaStore row hidden).
+* 1.4.1, keyboard open: a screenshot, then a paperclip hold after a gap of 0.1 to 2 seconds, attached that screenshot in 23 of 23 holds. When it was still being saved the plugin waited 108 to 323 ms for it. Two more holds at 0.1 and 0.15 seconds never became a long press at all: the screenshot overlay appearing cancels a finger that is already down, the same on 1.4.0.
+* 1.4.1, keyboard closed: the paperclip's long press right after a screenshot attached that screenshot 3 of 3 times (waited 764 to 862 ms).
+* Spoken "screenshot" right after a screenshot attached that screenshot 3 of 3 times (waited 315 to 645 ms).
+* "Picture" while a camera photo was still being written (a real pending MediaStore row, written over 1.5 seconds) attached that photo after 1.2 seconds.
+* A photo still being written after 8 seconds: the plugin gave up and attached the one before, as before. One deleted while being written: the one before. One left unfinished for over a minute: skipped at once, no wait.
+* Leaving the chat while a lookup was waiting stopped the wait at once and attached nothing.
+* Holding longer right after a screenshot added the new screenshot first, then the older ones in order. Six of them went out as one album; the X, leaving the chat, landscape and back, and ten minutes of normal use in the chat all behaved as in 1.4.0, with an empty crash log and no ANR.
+* A normal pick with nothing being saved: 37.7 ms on average over 50 picks for 1.4.1, 37.1 ms over 35 picks for 1.4.0, on the background thread. Nothing runs on the main thread that did not before.
 
 Version 1.4.0, same phone, Gboard voice typing listening, chunks replayed into the field's InputConnection, real screenshots and camera photos on the phone, in Saved Messages:
 

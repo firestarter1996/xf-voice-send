@@ -61,6 +61,8 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
     private static final WeakHashMap<View, ShotTray> TRAYS = new WeakHashMap<>();
     private static final Handler UI = new Handler(Looper.getMainLooper());
     private static ThreadPoolExecutor io;
+    /** MediaStore.QUERY_ARG_MATCH_PENDING (API 30); 1 = MediaStore.MATCH_INCLUDE. */
+    private static final String MATCH_PENDING = "android:query-arg-match-pending";
 
     private final View enter;
     private final EditText field;
@@ -122,9 +124,11 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
                     String path = null;
                     Bitmap bmp = null;
                     try {
+                        long t0 = SystemClock.uptimeMillis();
                         String[] row = tray.pick(ctx, g, kind);
                         if (row != null) {
                             path = row[0];
+                            Log.i(TAG, "attach: picked " + new File(path).getName() + " in " + (SystemClock.uptimeMillis() - t0) + " ms");
                             bmp = thumb(ctx, row, density);
                         }
                     } catch (Throwable e) {
@@ -238,20 +242,117 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
         return io;
     }
 
+    /** A row still being written counts only when it was added this recently (seconds): an abandoned one never makes a pick wait. */
+    private static final long FRESH_S = 60;
+    /** How long a pick waits for a picture that is still being written, and how often it looks again. */
+    private static final long WAIT_MS = 8000;
+    private static final long STEP_MS = 100;
+
     /** The newest screenshot or camera photo not yet claimed by this tray: {path, MediaStore id or null}. */
     private String[] pick(Context ctx, int g, int kind) {
         ArrayList<String[]> rows = newest(ctx, MAX + 4, kind);
         if (rows.isEmpty()) {
             rows = listed(MAX + 4, kind);
         }
+        // A picture taken a moment ago is still being written (its row is pending, its file empty or
+        // half done). When the newest row not in the tray is such a picture, wait for it here, on this
+        // background thread, instead of taking the one before it. Nothing pending: no wait at all.
+        try {
+            String[] first = null;
+            synchronized (claimed) {
+                if (g != gen) {
+                    return null;
+                }
+                long now = System.currentTimeMillis() / 1000;
+                for (String[] r : rows) {
+                    boolean pending = r.length > 3 && "1".equals(r[2]);
+                    if (pending && now - parse(r[3]) > FRESH_S) {
+                        continue; // left behind by an app long ago: never waited for, never attached
+                    }
+                    if (r[0] != null && !claimed.contains(r[0])) {
+                        first = r;
+                        break;
+                    }
+                }
+            }
+            if (first != null && first.length > 3 && "1".equals(first[2]) && first[1] != null) {
+                long t0 = SystemClock.uptimeMillis();
+                String[] fin = await(ctx, Long.parseLong(first[1]), g);
+                Log.i(TAG, "attach: newest picture was still being saved, waited " + (SystemClock.uptimeMillis() - t0)
+                        + " ms, " + (fin != null ? "took it" : !enter.isAttachedToWindow() ? "chat left" : "gave up, took the one before"));
+                if (fin == null && !enter.isAttachedToWindow()) {
+                    return null;
+                }
+                if (fin != null) {
+                    synchronized (claimed) {
+                        if (g != gen) {
+                            return null;
+                        }
+                        if (!claimed.contains(fin[0])) {
+                            claimed.add(fin[0]);
+                            return fin;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable e) {
+            Log.i(TAG, "screenshot wait: " + e);
+        }
         synchronized (claimed) {
             if (g != gen) {
                 return null;
             }
             for (String[] r : rows) {
-                if (r[0] != null && !claimed.contains(r[0]) && new File(r[0]).length() > 0) {
+                if (r[0] != null && !(r.length > 2 && "1".equals(r[2])) && !claimed.contains(r[0])
+                        && !new File(r[0]).getName().startsWith(".") && new File(r[0]).length() > 0) {
                     claimed.add(r[0]);
                     return r;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static long parse(String v) {
+        try {
+            return Long.parseLong(v);
+        } catch (Throwable e) {
+            return 0;
+        }
+    }
+
+    /** Background thread only. Wait for the row id to be written out: {path, id} once it is, null when it went away, the tray was emptied, the chat was left or time ran out. */
+    private String[] await(Context ctx, long id, int g) {
+        Uri u = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+        long end = SystemClock.uptimeMillis() + WAIT_MS;
+        while (SystemClock.uptimeMillis() < end) {
+            SystemClock.sleep(STEP_MS);
+            synchronized (claimed) {
+                if (g != gen) {
+                    return null;
+                }
+            }
+            if (!enter.isAttachedToWindow()) {
+                return null; // the chat was left: nothing to wait for
+            }
+            Cursor c = null;
+            try {
+                Bundle q = new Bundle();
+                q.putInt(MATCH_PENDING, 1);
+                c = ctx.getContentResolver().query(u, new String[]{"_data", "is_pending"}, q, null);
+                if (c == null || !c.moveToFirst()) {
+                    return null;
+                }
+                String path = c.getString(0);
+                if (c.getInt(1) == 0 && path != null && new File(path).length() > 0) {
+                    return new String[]{path, String.valueOf(id), "0", "0"};
+                }
+            } catch (Throwable e) {
+                Log.i(TAG, "screenshot wait query: " + e);
+                return null;
+            } finally {
+                if (c != null) {
+                    c.close();
                 }
             }
         }
@@ -264,7 +365,7 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
         try {
             ContentResolver cr = ctx.getContentResolver();
             Uri u = MediaStore.Images.Media.EXTERNAL_CONTENT_URI;
-            String[] proj = {"_id", "_data"};
+            String[] proj = Build.VERSION.SDK_INT >= 30 ? new String[]{"_id", "_data", "is_pending", "date_added"} : new String[]{"_id", "_data"};
             String sel = "(bucket_display_name = ? OR _data LIKE ?)";
             String[] args = kind == CAMERA ? new String[]{"Camera", "%/DCIM/Camera/%"} : new String[]{"Screenshots", "%/Screenshots/%"};
             String order = "date_added DESC, _id DESC";
@@ -274,12 +375,17 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
                 q.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, args);
                 q.putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, order);
                 q.putInt(ContentResolver.QUERY_ARG_LIMIT, limit);
+                q.putInt(MATCH_PENDING, 1); // include pictures still being written, so a pick can wait for them
                 c = cr.query(u, proj, q, null);
             } else {
                 c = cr.query(u, proj, sel, args, order + " LIMIT " + limit);
             }
             while (c != null && c.moveToNext() && out.size() < limit) {
-                out.add(new String[]{c.getString(1), String.valueOf(c.getLong(0))});
+                if (c.getColumnCount() > 3) {
+                    out.add(new String[]{c.getString(1), String.valueOf(c.getLong(0)), String.valueOf(c.getInt(2)), String.valueOf(c.getLong(3))});
+                } else {
+                    out.add(new String[]{c.getString(1), String.valueOf(c.getLong(0))});
+                }
             }
         } catch (Throwable e) {
             Log.i(TAG, "screenshot query: " + e);
