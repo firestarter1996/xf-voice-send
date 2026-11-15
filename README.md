@@ -1,6 +1,6 @@
 # 🎙️🗣️📤 Voice Send
 
-A plugin for Nagram XF. While you dictate with Gboard voice typing, say "send" and the message goes out, exactly like tapping the send button. Say "paste" and whatever you copied goes into the message box. Say "screenshot" or "picture" and your newest screenshot or camera photo is attached to the message you are writing. Hold the paperclip and screenshots keep coming for as long as you hold.
+A plugin for Nagram XF. While you dictate with Gboard voice typing, say "send" and the message goes out, exactly like tapping the send button. Say "paste" and whatever you copied goes into the message box. Say "screenshot" or "picture" and your newest screenshot or camera photo is attached to the message you are writing. Say "select all" and everything in the message box is selected. Hold the paperclip and screenshots keep coming for as long as you hold.
 
 ## Why I made it
 
@@ -26,12 +26,14 @@ Gboard's voice typing understands "send" in Telegram, WhatsApp and a few other a
 * "Screenshot" and "picture" stay text after "a", "the", "this", "that", "my", "your", "of", "in", "take", "send", "see", "big", "profile", "nice" and similar words, so "take a screenshot", "send me a picture", "in the picture" and "look at this screenshot" are typed as words. They also stay text in the middle of a sentence ("take a picture of it") and while you edit a message. Said on its own after a pause, the word is the command.
 * The lookup reads only the newest rows of your Screenshots folder (Pictures/Screenshots or DCIM/Screenshots) or of DCIM/Camera, and runs on a background thread. Screenshot, picture and the paperclip hold each have their own switch.
 * A screenshot or photo you took a second ago is the one you get. Android takes a moment to finish saving a new screenshot (on a Pixel 6 Pro up to about a second, longer for a big one) and hides it while it does, so 1.4.0 could attach the one before it. Since 1.4.1 the lookup sees a picture that is still being saved, waits on its background thread until it is finished (checking every 0.1 second, at most 8 seconds) and attaches it. With nothing being saved there is no wait and no extra work.
+* Saying "select all" as the last words selects everything in the message box and shows Cut, Copy and Paste, the same as tapping Select all. Keep dictating and your words replace the selection.
+* "Select all" stays text after "to", "can", "you", "then", "tap", "press" and similar words, so "you can select all" and "then tap select all" are typed as words. It also stays text in the middle of a sentence ("select all of them"). It has its own switch.
 * While you edit a message, "send" saves the edit, like the check mark.
 * In slow mode it does what tapping the timer does.
 * The Enter key still makes a new line, your Send by Enter setting stays as it is, and autocorrect and suggestions are unchanged.
 * Work happens once when a chat's message field is created, a short text check once per finished word, and once for each spoken "send". Nothing runs per letter or per frame.
 
-Settings: one switch each for send, paste, screenshot, picture and the paperclip hold. All are on at first.
+Settings: one switch each for send, paste, screenshot, picture, select all and the paperclip hold. All are on at first.
 
 ## Install
 
@@ -50,6 +52,8 @@ Stock XF has no place where a photo can wait in the message box. Its attach shee
 
 The paperclip hold (`ClipHold`, the third Java class) uses the button's own long press detection, then one posted repeat every 0.7 seconds while the finger is down, removed the moment it lifts. The button's click listener is untouched.
 
+Spoken "select all" uses the same watch. When a finished chunk ends in those two words while voice typing is on, the words are dropped and the field gets Android's own set selection action for the whole text, which also brings up the Cut, Copy, Paste menu. The check is a short string test on the end of the chunk and reads at most the last 24 characters already in the box.
+
 ## Build
 
 `voice_send.plugin` is `voice_send.src.py` plus the compiled Java classes (MicWatch, ShotTray and ClipHold). `build.py` lists the javac and d8 steps and writes the plugin file.
@@ -65,6 +69,14 @@ Nagram XF 12.10.1 plugin build on a Pixel 6 Pro with Gboard 18.5:
 * The same chunk finished through `setComposingText` plus `finishComposingText` also sent.
 * With the microphone off, ") send" and "send" stay as typed text, and "please send" never triggers.
 * The extra hook costs about 0.15 ms per finished word.
+
+Version 1.5.0, Pixel 6 Pro test phone, Gboard voice typing listening, chunks replayed into the field's InputConnection, in Saved Messages:
+
+* "Alpha beta gamma." then " Select all." as separate chunks: the two words were dropped, the whole text was selected and the Cut, Copy, Paste menu showed. The next chunk replaced the selection.
+* "One two. Select all" finished through `setComposingText` plus `finishComposingText`: the same.
+* "you can select all" and "then tap" followed by " select all" stayed text.
+* With the microphone off, "One two. Select all" stayed text.
+* A 10 minute run of typing, text menus, selection changes, rotation with the keyboard open, fast chat switching and repeated spoken "select all": same app process from start to end, empty crash log, no plugin errors.
 
 Version 1.4.1, Pixel 6 Pro test phone, real screenshots taken with the screenshot key, in Saved Messages:
 

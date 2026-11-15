@@ -1,8 +1,8 @@
 __id__ = "voice_send"
 __name__ = "Voice Send"
-__description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Say \"paste\" and the clipboard text goes in. Say \"screenshot\" or \"picture\" and your newest screenshot or camera photo is attached, say it again for the one before. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
+__description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Say \"paste\" and the clipboard text goes in. Say \"screenshot\" or \"picture\" and your newest screenshot or camera photo is attached, say it again for the one before. Say \"select all\" and everything in the message box is selected. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 __min_version__ = "12.5.1"
 
 # Two routes to the same tap of the send button.
@@ -63,6 +63,12 @@ __min_version__ = "12.5.1"
 #    attach menu; stock XF has nothing on a long press of that button. ClipHold (Java): the view's
 #    own long press detection plus one posted repeat while held. Its own switch.
 #
+# 7. Spoken "select all". The same watch, the same voice typing window: when the last words of a
+#    finished chunk are "select all", they are dropped and everything in the message box is
+#    selected, with the Cut, Copy, Paste menu up, as after a tap on Select all. Stays text after
+#    "to", "can", "you", "then", "tap" and similar words ("you can select all"), and in the middle
+#    of a sentence ("select all of them"). Its own switch. Nothing else is combined with it.
+#
 # Cost: one Python call per commitText and finishComposingText of the message field (once per word,
 # never per letter: letters go through setComposingText, which is not hooked) and a string test on
 # the end of the chunk; no binder call, nothing per frame, no polling. The microphone state comes
@@ -98,7 +104,36 @@ def _log(msg):
 def _hint(s):
     """Cheap first test on the last few letters: could the chunk end in send, paste, past or screenshot?"""
     low = s[-8:].lower()
-    return "end" in low or "ast" in low or "hot" in low or "ture" in low
+    return "end" in low or "ast" in low or "hot" in low or "ture" in low or "all" in low
+
+
+# "select all" stays text after these words: "you can select all", "then select all", "tap select all".
+_SEL_TEXT_AFTER = {"to", "can", "could", "should", "would", "will", "must", "may", "might", "and",
+                   "or", "then", "just", "not", "don't", "didn't", "doesn't", "can't", "cannot",
+                   "you", "i", "we", "they", "he", "she", "it", "who", "that", "which", "always",
+                   "never", "also", "tap", "tapped", "hit", "press", "pressed", "click", "clicked",
+                   "choose", "chose", "say", "said", "says", "saying", "called", "the", "a", "of",
+                   "like", "with", "using", "use", "used", "try", "tried", "let's", "lets", "me",
+                   "button", "option", "command", "by", "from", "for", "on", "in", "did", "do",
+                   "does", "if", "when", "was", "is", "be", "no"}
+
+
+def _sel_all(s, before=""):
+    """Spoken "select all" as the last words of a finished chunk: the text to keep, or None.
+
+    before = the text already in the box in front of the chunk, used when the chunk is the words alone."""
+    if not s:
+        return None
+    t = s.rstrip(_TRAIL)
+    if t[-10:].lower() != "select all":
+        return None
+    head = t[:-10]
+    if head and (head[-1].isalnum() or head[-1] in "'\u2019_-"):
+        return None  # part of a longer word: deselect all
+    words = (head if head.strip() else before).lower().replace(",", " ").split()
+    if words and words[-1] in _SEL_TEXT_AFTER:
+        return None
+    return _tidy(head)
 
 
 def _without(opts):
@@ -234,6 +269,8 @@ class VoiceSendPlugin(BasePlugin):
                    on_change=self._on_shot_toggle),
             Switch(key="picture", text="Say \"picture\" to attach", default=True,
                    subtext="While dictating, saying picture as the last word attaches the newest photo from your camera roll to the message you are writing. Say it again for the one before it. Nothing is sent until you send."),
+            Switch(key="select_all", text="Say \"select all\" to select", default=True,
+                   subtext="While dictating, saying select all as the last words selects everything in the message box and shows Cut, Copy and Paste."),
             Switch(key="clip_hold", text="Hold the paperclip for screenshots", default=True,
                    subtext="A long press on the paperclip attaches your newest screenshot and keeps adding the one before it while you hold. A short tap opens the attach menu as before.",
                    on_change=self._on_clip_toggle),
@@ -341,6 +378,12 @@ class VoiceSendPlugin(BasePlugin):
                         plugin._trace("commit", s, field)
                     if not s or not _hint(s):
                         return
+                    keep = plugin._sel(s, field, None)
+                    if keep is not None:
+                        plugin.in_commit = plugin.SystemClock.uptimeMillis()
+                        param.args[0] = keep
+                        plugin._select(field)
+                        return
                     r = plugin._read(s, field)
                     if r is None or not plugin.get_setting("enabled", True):
                         return
@@ -385,6 +428,11 @@ class VoiceSendPlugin(BasePlugin):
                     s = str(ed.subSequence(a, b))
                     if plugin.debug:
                         plugin._trace("finish", s, field)
+                    keep = plugin._sel(s, field, a)
+                    if keep is not None:
+                        ed.replace(a, b, keep)
+                        plugin._select(field)
+                        return
                     r = plugin._read(s, field)
                     if r is None or not plugin.get_setting("enabled", True):
                         return
@@ -750,6 +798,50 @@ class VoiceSendPlugin(BasePlugin):
         except Exception as e:
             self._err("mic", e)
             return False
+
+    def _sel(self, s, field, start):
+        """Text to keep when the chunk ends in a spoken "select all" (voice typing on), else None."""
+        if s[-12:].lower().find("all") < 0 or not self.get_setting("select_all", True):
+            return None
+        before = ""
+        try:
+            ed = field.getText()
+            if start is None:
+                start = self.BIC.getComposingSpanStart(ed)
+                if start < 0:
+                    start = min(field.getSelectionStart(), field.getSelectionEnd())
+            start = max(0, min(int(start), ed.length()))
+            before = str(ed.subSequence(max(0, start - 24), start))
+        except Exception as e:
+            self._err("select before", e)
+        keep = _sel_all(s, before)
+        if keep is None or not self._mic_on():
+            return None
+        return keep
+
+    def _select(self, field):
+        """Select everything in the box once the keyboard's current call has applied, menu up."""
+        _log("spoken select all: words dropped, selecting")
+        plugin = self
+
+        def go():
+            try:
+                n = int(field.length())
+                if n <= 0:
+                    return
+                done = False
+                try:
+                    b = jclass("android.os.Bundle")()
+                    b.putInt("ACTION_ARGUMENT_SELECTION_START_INT", 0)
+                    b.putInt("ACTION_ARGUMENT_SELECTION_END_INT", n)
+                    done = bool(field.performAccessibilityAction(0x20000, b))  # ACTION_SET_SELECTION: selects and shows the menu
+                except Exception as e:
+                    plugin._err("select menu", e)
+                if not done or field.getSelectionStart() != 0 or field.getSelectionEnd() != n:
+                    field.setSelection(0, n)
+            except Exception as e:
+                plugin._err("select", e)
+        jclass("org.telegram.messenger.AndroidUtilities").runOnUIThread(self._r2(go))
 
     def _fire(self, field):
         """Press send once the keyboard's current call has applied (the word is already dropped)."""
