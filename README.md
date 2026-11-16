@@ -1,6 +1,6 @@
 # 🎙️🗣️📤 Voice Send
 
-A plugin for Nagram XF. While you dictate with Gboard voice typing, say "send" and the message goes out, exactly like tapping the send button. Say "paste" and whatever you copied goes into the message box. Say "screenshot" or "picture" and your newest screenshot or camera photo is attached to the message you are writing. Say "select all" and everything in the message box is selected. Hold the paperclip and XF's own attach menu opens with your screenshots ticked, one more for as long as you hold.
+A plugin for Nagram XF. While you dictate with Gboard voice typing, say "send" and the message goes out, exactly like tapping the send button. Say "paste" and whatever you copied goes into the message box. Say "screenshot" or "picture" and your newest screenshot or camera photo is attached to the message you are writing. Say "select all" and everything in the message box is selected. Hold the paperclip and your newest screenshot is attached straight into the message box, one more for as long as you hold, without the attach menu opening.
 
 ## Why I made it
 
@@ -15,13 +15,13 @@ Gboard's voice typing understands "send" in Telegram, WhatsApp and a few other a
 * Saying "paste" as the last word puts your clipboard text in the message box in place of the word, without sending. Gboard sometimes writes it "past"; both count. "Paste send" pastes, then sends.
 * "Paste" stays text after "copy and", "cut and", "copy", "the", "half", "quarter", "went", "go", "goes", "going", "walked", "drove", "ran", "get", "got", "way", "long" and "far", so "copy and paste", "in the past" and "half past" are typed as words. With an empty clipboard the word stays as text too.
 * The clipboard is read only at the moment you say "paste", and its text is never logged. A second switch turns paste off.
-* Saying "screenshot" as the last word attaches your newest screenshot to the message you are writing. It waits in a small strip above the message box and nothing is sent until you send. "Screen shot" and "screenshots" count too.
+* Saying "screenshot" as the last word attaches your newest screenshot to the message you are writing. It waits in a small strip above the message box, drawn like the app's own photo picker (square pictures with its numbered blue ticks), and nothing is sent until you send. "Screen shot" and "screenshots" count too.
 * Say "screenshot" again and the one before it is added, then the one before that, up to ten, never the same file twice. They go out together as one album, in the order you added them.
 * Whatever is in the message box goes out as the caption. "Screenshot send" attaches, then sends.
 * With screenshots waiting, the send button shows even when the box is empty, so a tap sends them too.
 * Saying "picture" does the same with the newest photo of your camera roll (DCIM/Camera, photos only, no videos). Say it again for the photo before it. "Picture send" attaches, then sends.
 * "Screenshot" and "picture" share one strip, so "screenshot", "picture", "picture" goes out as one album in the order you said them.
-* A long press on the paperclip opens XF's own attach menu with your newest screenshot already ticked. Keep holding and the one before it is ticked about every 0.7 seconds (ten at most), with a light tick each (none when vibration is off in the app), until you lift your finger. The grid, the numbered ticks, the counter, the caption field and the send button are the app's own, so a hold looks and sends exactly like picking the same screenshots by hand (since 1.6.0; before that the hold filled a small tray of its own above the message box). A short tap opens the attach menu as before. Stock XF does nothing on a long press of the paperclip, so nothing is lost.
+* A long press on the paperclip attaches your newest screenshot straight into the strip above the message box, without opening the attach menu. Keep holding and the one before it is added about every 0.7 seconds (ten at most), with a light tick each (none when vibration is off in the app), until you lift your finger. A short tap opens the attach menu as before. Stock XF does nothing on a long press of the paperclip, so nothing is lost. (1.6.0 opened the attach menu and ticked the screenshots there instead; 1.6.1 brought back the straight attach and draws the strip like the picker instead.)
 * The X on the strip removes them. The strip also empties when the message is sent, when you empty the message box by hand and when you leave the chat. After that, "screenshot" and "picture" start again from the newest.
 * "Screenshot" and "picture" stay text after "a", "the", "this", "that", "my", "your", "of", "in", "take", "send", "see", "big", "profile", "nice" and similar words, so "take a screenshot", "send me a picture", "in the picture" and "look at this screenshot" are typed as words. They also stay text in the middle of a sentence ("take a picture of it") and while you edit a message. Said on its own after a pause, the word is the command.
 * The lookup reads only the newest rows of your Screenshots folder (Pictures/Screenshots or DCIM/Screenshots) or of DCIM/Camera, and runs on a background thread. Screenshot, picture and the paperclip hold each have their own switch.
@@ -50,7 +50,9 @@ Gboard does not always treat "send" as a command. Its modeless command detector 
 
 Stock XF has no place where a photo can wait in the message box. Its attach sheet is a separate window, so opening it takes the keyboard away and ends the dictation, and it forgets its ticked photos every time it opens. So spoken "screenshot" and "picture" keep their own small tray per message box (`ShotTray`, the second Java class in the plugin). One MediaStore query for the newest rows of the Screenshots or Camera folder and the thumbnail run on a background thread; the UI thread only adds the thumbnail to the strip. Every way of sending the box (the send button, Enter, spoken "send", silent and scheduled send) ends in `ChatActivityEnterView.sendMessageInternal`; a hook there sees a tray that is not empty and hands the files to `ChatActivity.didSelectSearchPhotos`, the app's own call for picked photos, with the box text as the caption of the first one. Replies, topics and slow mode behave as they do for photos picked in the attach sheet. Text too long for a caption follows the album as its own message. While the tray is empty none of its listeners exist.
 
-The paperclip hold (`ClipHold`, the third Java class) uses the button's own long press detection, performs the button's own click so XF opens its attach sheet, then ticks screenshots the way the sheet's own tick circle does (`setChecked`, `addToSelectedPhotos`, `updateCountButton`), one posted repeat every 0.7 seconds while the finger is down, removed the moment it lifts. The screenshots come from the gallery list the sheet already loaded, so there is no query of its own. Every step is wrapped: anything unexpected ends the hold and leaves the plain attach sheet open. The button's click listener is untouched.
+The paperclip hold (`ClipHold`, the third Java class) uses the button's own long press detection, then one posted repeat every 0.7 seconds while the finger is down, removed the moment it lifts. Each step adds one picture to the same tray spoken "screenshot" uses. The button's click listener is untouched.
+
+The strip borrows the picker's own parts: each picture is a square with the picker's `CheckBox2` tick (24 dp, the same arc and the theme's attach tick colours) numbered in attach order, the message panel's theme colour behind them and the app's own close icon. Pictures are 64 dp and get smaller when more would not fit across the chat (never under 24 dp; under 40 dp the ticks are left out). Every borrowed part is looked up by name and falls back to a plain look, so a new XF build cannot break the strip.
 
 Spoken "select all" uses the same watch. When a finished chunk ends in those two words while voice typing is on, the words are dropped and the field gets Android's own set selection action for the whole text, which also brings up the Cut, Copy, Paste menu. The check is a short string test on the end of the chunk and reads at most the last 24 characters already in the box.
 
@@ -69,6 +71,13 @@ Nagram XF 12.10.1 plugin build on a Pixel 6 Pro with Gboard 18.5:
 * The same chunk finished through `setComposingText` plus `finishComposingText` also sent.
 * With the microphone off, ") send" and "send" stay as typed text, and "please send" never triggers.
 * The extra hook costs about 0.15 ms per finished word.
+
+Version 1.6.1, Pixel 6 Pro test phone set to the 8 Pro's screen, same XF build and plugins, real touches:
+
+* Holds of 1.3 and 3.5 seconds put 2 and 5 screenshots straight into the strip, numbered 1 to 5 with the picker's blue ticks; the attach menu never opened.
+* The send button sent the strip of two as one album in the strip's order.
+* With the keyboard open the strip sits right above the message box; with eight pictures they shrink to fit across the chat.
+* Ten minutes of mixed use: holds of 0.6, 1.3 and 3.5 seconds, the keyboard opened and closed, rotation to landscape and back with the strip showing, fast switching between busy topics. XF kept the same process the whole time, the crash log stayed empty and the plugin logged no errors.
 
 Version 1.6.0, Pixel 6 Pro test phone set to the 8 Pro's screen, same XF build and plugins, real touches, in Saved Messages:
 
