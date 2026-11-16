@@ -436,8 +436,8 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
     }
 
     private static Bitmap thumb(Context ctx, String[] row, float density) {
-        int w = (int) (60 * density);
-        int h = (int) (104 * density);
+        int w = (int) (64 * density);
+        int h = (int) (150 * density);
         try {
             if (Build.VERSION.SDK_INT >= 29 && row[1] != null) {
                 Uri u = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, Long.parseLong(row[1]));
@@ -490,44 +490,153 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
         return (int) Math.ceil(v * enter.getResources().getDisplayMetrics().density);
     }
 
+    /** The app's theme colour for a Theme key name, or the fallback. */
+    private int themeColor(String key, int fallback) {
+        try {
+            Class<?> th = Class.forName("org.telegram.ui.ActionBar.Theme", false, enter.getClass().getClassLoader());
+            int k = th.getField(key).getInt(null);
+            return (Integer) th.getMethod("getColor", int.class).invoke(null, k);
+        } catch (Throwable e) {
+            return fallback;
+        }
+    }
+
+    /**
+     * 1.6.1: the tray is drawn like the app's own photo picker: square pictures with the picker's own
+     * numbered blue tick (CheckBox2, the same size, arc and colours PhotoAttachPhotoCell uses), the
+     * message panel's colour behind them and the app's own close icon. Every step falls back to a
+     * plain look if a class or field is missing, so a new XF build can never break the tray.
+     */
+    private View tick(Context ctx, int num) {
+        try {
+            ClassLoader cl = enter.getClass().getClassLoader();
+            Class<?> cb = Class.forName("org.telegram.ui.Components.CheckBox2", false, cl);
+            Class<?> th = Class.forName("org.telegram.ui.ActionBar.Theme", false, cl);
+            View v = (View) cb.getConstructor(Context.class, int.class).newInstance(ctx, 24);
+            cb.getMethod("setDrawBackgroundAsArc", int.class).invoke(v, 7);
+            cb.getMethod("setColor", int.class, int.class, int.class).invoke(v,
+                    th.getField("key_chat_attachCheckBoxBackground").getInt(null),
+                    th.getField("key_chat_attachPhotoBackground").getInt(null),
+                    th.getField("key_chat_attachCheckBoxCheck").getInt(null));
+            cb.getMethod("setChecked", int.class, boolean.class, boolean.class).invoke(v, num, true, false);
+            return v;
+        } catch (Throwable e) {
+            Log.i(TAG, "screenshot tick: " + e);
+            return null;
+        }
+    }
+
+    /** Square pictures 64 dp wide, smaller when that many would not fit across the chat (never under 24 dp). */
+    private void fit() {
+        LinearLayout s = strip;
+        if (s == null) {
+            return;
+        }
+        int n = s.getChildCount() - 1;
+        if (n <= 0) {
+            return;
+        }
+        int avail = content.getWidth();
+        if (avail <= 0) {
+            avail = enter.getResources().getDisplayMetrics().widthPixels;
+        }
+        avail -= dp(16) + dp(42) + dp(6);
+        int side = Math.max(dp(24), Math.min(dp(64), avail / n - dp(4)));
+        for (int i = 0; i < n; i++) {
+            View c = s.getChildAt(i);
+            if (!(c instanceof FrameLayout)) {
+                continue;
+            }
+            ViewGroup.LayoutParams lp = c.getLayoutParams();
+            if (lp != null && lp.width != side) {
+                lp.width = side;
+                lp.height = side;
+                c.setLayoutParams(lp);
+                View iv = ((FrameLayout) c).getChildAt(0);
+                if (iv != null && iv.getLayoutParams() != null) {
+                    iv.getLayoutParams().width = side;
+                    iv.getLayoutParams().height = side;
+                    iv.setLayoutParams(iv.getLayoutParams());
+                }
+                View tk = ((FrameLayout) c).getChildCount() > 1 ? ((FrameLayout) c).getChildAt(1) : null;
+                if (tk != null) {
+                    tk.setVisibility(side >= dp(40) ? View.VISIBLE : View.GONE);
+                }
+            }
+        }
+        View x = s.getChildAt(n);
+        if (x != null && x.getLayoutParams() != null && x.getLayoutParams().height != side) {
+            x.getLayoutParams().height = side;
+            x.setLayoutParams(x.getLayoutParams());
+        }
+    }
+
     private void show(Bitmap bmp) {
         Context ctx = enter.getContext();
+        int side = dp(64);
         if (strip == null) {
             strip = new LinearLayout(ctx);
             strip.setOrientation(LinearLayout.HORIZONTAL);
             strip.setGravity(Gravity.CENTER_VERTICAL);
             GradientDrawable bg = new GradientDrawable();
-            bg.setColor(0xE61C1C1E);
-            bg.setCornerRadius(dp(12));
+            bg.setColor(themeColor("key_chat_messagePanelBackground", 0xE61C1C1E));
+            bg.setCornerRadius(dp(14));
             strip.setBackground(bg);
-            strip.setPadding(dp(4), dp(4), dp(2), dp(4));
-            TextView x = new TextView(ctx);
-            x.setText("✕");
-            x.setTextColor(0xFFFFFFFF);
-            x.setTextSize(16);
-            x.setGravity(Gravity.CENTER);
+            strip.setElevation(dp(2));
+            strip.setPadding(dp(5), dp(5), dp(1), dp(5));
+            View x = null;
+            int icon = ctx.getResources().getIdentifier("msg_close", "drawable", ctx.getPackageName());
+            if (icon != 0) {
+                try {
+                    ImageView ix = new ImageView(ctx);
+                    ix.setImageResource(icon);
+                    ix.setScaleType(ImageView.ScaleType.CENTER);
+                    ix.setColorFilter(themeColor("key_chat_messagePanelIcons", 0xFFFFFFFF));
+                    x = ix;
+                } catch (Throwable e) {
+                    x = null;
+                }
+            }
+            if (x == null) {
+                TextView tx = new TextView(ctx);
+                tx.setText("\u2715");
+                tx.setTextColor(themeColor("key_chat_messagePanelIcons", 0xFFFFFFFF));
+                tx.setTextSize(16);
+                tx.setGravity(Gravity.CENTER);
+                x = tx;
+            }
             x.setContentDescription("Remove attachments");
             x.setOnClickListener(this);
-            strip.addView(x, new LinearLayout.LayoutParams(dp(34), dp(52)));
+            strip.addView(x, new LinearLayout.LayoutParams(dp(36), side));
         }
+        FrameLayout cell = new FrameLayout(ctx);
         ImageView iv = new ImageView(ctx);
         iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        iv.setBackgroundColor(0xFF3A3A3C);
+        iv.setBackgroundColor(themeColor("key_chat_attachPhotoBackground", 0xFF3A3A3C));
         if (bmp != null) {
             iv.setImageBitmap(bmp);
         }
-        final int rad = dp(5);
-        iv.setOutlineProvider(new ViewOutlineProvider() {
+        final int rad = dp(8);
+        cell.setOutlineProvider(new ViewOutlineProvider() {
             @Override
             public void getOutline(View v, Outline o) {
-                o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), rad);
+                o.setRoundRect(0, 0, Math.max(1, v.getWidth()), Math.max(1, v.getHeight()), rad);
             }
         });
-        iv.setClipToOutline(true);
-        iv.setContentDescription("Attachment " + paths.size());
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(30), dp(52));
-        lp.rightMargin = dp(3);
-        strip.addView(iv, strip.getChildCount() - 1, lp);
+        cell.setClipToOutline(true);
+        cell.addView(iv, new FrameLayout.LayoutParams(side, side));
+        View t = tick(ctx, Math.max(0, paths.size() - 1));   // the picker counts from 0 and draws the number plus one
+        if (t != null) {
+            FrameLayout.LayoutParams tl = new FrameLayout.LayoutParams(dp(26), dp(26), Gravity.TOP | Gravity.RIGHT);
+            tl.topMargin = dp(3);
+            tl.rightMargin = dp(3);
+            cell.addView(t, tl);
+        }
+        cell.setContentDescription("Attachment " + paths.size());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(side, side);
+        lp.rightMargin = dp(4);
+        strip.addView(cell, strip.getChildCount() - 1, lp);
+        fit();
         if (!showing) {
             showing = true;
             lastY = Float.NaN;
