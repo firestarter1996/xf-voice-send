@@ -2,7 +2,7 @@ __id__ = "voice_send"
 __name__ = "Voice Send"
 __description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Say \"paste\" and the clipboard text goes in. Say \"screenshot\" or \"picture\" and your newest screenshot or camera photo is attached, say it again for the one before. Say \"select all\" and everything in the message box is selected. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 __min_version__ = "12.5.1"
 
 # Two routes to the same tap of the send button.
@@ -57,15 +57,11 @@ __min_version__ = "12.5.1"
 #    (DCIM/Camera, pictures only, no videos). Both kinds share one tray, so "screenshot", "picture",
 #    "picture" makes one album in the order spoken. Its own switch.
 #
-# 6. A long press on the paperclip. Not a voice command. Since 1.6.0 it has no look of its own:
-#    the hold opens the app's own attach sheet (the paperclip's own click) and ticks the newest
-#    screenshot in it, then the one before it about every 0.7 seconds until the finger lifts (ten
-#    at most), with a light tick each (unless the app's vibration is off). Each tick runs the steps
-#    of the sheet's own tick circle (cell.setChecked, addToSelectedPhotos, updateCountButton), so
-#    the grid, the numbered ticks, the counter, the caption field and the send button are stock and
-#    the album goes out through the sheet's own send. Before 1.6.0 the hold filled the plugin's tray
-#    above the message box, which did not look like the app's own multi photo attach. A short tap
-#    still opens the plain attach sheet. ClipHold (Java). Its own switch.
+# 6. A long press on the paperclip. Not a voice command, but the same tray: holding the paperclip
+#    adds the newest screenshot, then the one before it about every 0.7 seconds until the finger
+#    lifts, with a light tick each (unless the app's vibration is off). A short tap still opens the
+#    attach menu; stock XF has nothing on a long press of that button. ClipHold (Java): the view's
+#    own long press detection plus one posted repeat while held. Its own switch.
 #
 # 7. Spoken "select all". The same watch, the same voice typing window: when the last words of a
 #    finished chunk are "select all", they are dropped and everything in the message box is
@@ -276,7 +272,7 @@ class VoiceSendPlugin(BasePlugin):
             Switch(key="select_all", text="Say \"select all\" to select", default=True,
                    subtext="While dictating, saying select all as the last words selects everything in the message box and shows Cut, Copy and Paste."),
             Switch(key="clip_hold", text="Hold the paperclip for screenshots", default=True,
-                   subtext="A long press on the paperclip opens the attach menu with your newest screenshot ticked and keeps ticking the one before it while you hold. A short tap opens the attach menu as before.",
+                   subtext="A long press on the paperclip attaches your newest screenshot and keeps adding the one before it while you hold. A short tap opens the attach menu as before.",
                    on_change=self._on_clip_toggle),
         ]
 
