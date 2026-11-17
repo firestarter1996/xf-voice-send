@@ -11,7 +11,8 @@ import java.util.ArrayList;
 import java.util.WeakHashMap;
 
 /**
- * A long press on the paperclip puts the newest screenshot in the message box's tray, and keeps
+ * A long press on the paperclip puts the newest screenshot (or, by the Hold inserts setting, the
+ * newest image of any folder) in the message box's tray, and keeps
  * adding the one before it for as long as the finger stays down. A short tap is untouched (the
  * button's own click listener opens the attach menu as before).
  *
@@ -21,6 +22,8 @@ import java.util.WeakHashMap;
 public final class ClipHold implements View.OnLongClickListener, View.OnTouchListener, Runnable {
 
     public static volatile boolean enabled = true;
+    /** What a hold adds: ShotTray.SCREENSHOT or ShotTray.ANY (the newest image of any folder). */
+    public static volatile int kind = ShotTray.SCREENSHOT;
     private static final long REPEAT_MS = 700;
     private static final WeakHashMap<View, ClipHold> HOLDS = new WeakHashMap<>();
 
@@ -99,7 +102,7 @@ public final class ClipHold implements View.OnLongClickListener, View.OnTouchLis
         if (!ShotTray.room(enter)) {
             return;
         }
-        ShotTray.add(enter, field, content, bubble, 1, ShotTray.SCREENSHOT);
+        ShotTray.add(enter, field, content, bubble, 1, kind == ShotTray.ANY ? ShotTray.ANY : ShotTray.SCREENSHOT);
         if (haptics()) {
             button.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
         }
