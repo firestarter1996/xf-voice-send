@@ -100,8 +100,10 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
 
     public static final int SCREENSHOT = 0;
     public static final int CAMERA = 1;
+    /** The newest image in any folder the gallery shows (MediaStore Images, by date added). */
+    public static final int ANY = 2;
 
-    /** Ask for the next n newest screenshots (kind 0) or camera photos (kind 1) not in this box's tray yet. */
+    /** Ask for the next n newest screenshots (kind 0), camera photos (kind 1) or images of any folder (kind 2) not in this box's tray yet. */
     public static void add(View enter, EditText field, ViewGroup content, Object bubble, int n, final int kind) {
         ShotTray t = TRAYS.get(enter);
         if (t == null) {
@@ -251,8 +253,22 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
     /** The newest screenshot or camera photo not yet claimed by this tray: {path, MediaStore id or null}. */
     private String[] pick(Context ctx, int g, int kind) {
         ArrayList<String[]> rows = newest(ctx, MAX + 4, kind);
+        if (rows.isEmpty() && kind == ANY) {
+            kind = SCREENSHOT; // any folder gave nothing: behave as the screenshot lookup always has
+            rows = newest(ctx, MAX + 4, kind);
+        }
         if (rows.isEmpty()) {
             rows = listed(MAX + 4, kind);
+        }
+        if (kind == ANY) {
+            // never a picture from a hidden folder (a dot folder or one holding .nomedia)
+            ArrayList<String[]> seen = new ArrayList<>();
+            for (String[] r : rows) {
+                if (r[0] != null && !hidden(r[0])) {
+                    seen.add(r);
+                }
+            }
+            rows = seen;
         }
         // A picture taken a moment ago is still being written (its row is pending, its file empty or
         // half done). When the newest row not in the tray is such a picture, wait for it here, on this
@@ -313,6 +329,27 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
         return null;
     }
 
+    /** Is this file inside a dot folder or a folder (at any level) that holds a .nomedia file? Background thread. */
+    private static boolean hidden(String path) {
+        try {
+            String root = Environment.getExternalStorageDirectory().getAbsolutePath();
+            File d = new File(path).getParentFile();
+            for (int i = 0; d != null && i < 12; i++) {
+                String p = d.getAbsolutePath();
+                if (p.length() <= root.length() || !p.startsWith(root)) {
+                    break;
+                }
+                if (d.getName().startsWith(".") || new File(d, ".nomedia").exists()) {
+                    return true;
+                }
+                d = d.getParentFile();
+            }
+            return false;
+        } catch (Throwable e) {
+            return true;
+        }
+    }
+
     private static long parse(String v) {
         try {
             return Long.parseLong(v);
@@ -366,13 +403,15 @@ public final class ShotTray implements ViewTreeObserver.OnPreDrawListener, View.
             ContentResolver cr = ctx.getContentResolver();
             Uri u = MediaStore.Images.Media.EXTERNAL_CONTENT_URI;
             String[] proj = Build.VERSION.SDK_INT >= 30 ? new String[]{"_id", "_data", "is_pending", "date_added"} : new String[]{"_id", "_data"};
-            String sel = "(bucket_display_name = ? OR _data LIKE ?)";
-            String[] args = kind == CAMERA ? new String[]{"Camera", "%/DCIM/Camera/%"} : new String[]{"Screenshots", "%/Screenshots/%"};
+            String sel = kind == ANY ? null : "(bucket_display_name = ? OR _data LIKE ?)";
+            String[] args = kind == ANY ? null : kind == CAMERA ? new String[]{"Camera", "%/DCIM/Camera/%"} : new String[]{"Screenshots", "%/Screenshots/%"};
             String order = "date_added DESC, _id DESC";
             if (Build.VERSION.SDK_INT >= 30) {
                 Bundle q = new Bundle();
-                q.putString(ContentResolver.QUERY_ARG_SQL_SELECTION, sel);
-                q.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, args);
+                if (sel != null) {
+                    q.putString(ContentResolver.QUERY_ARG_SQL_SELECTION, sel);
+                    q.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, args);
+                }
                 q.putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, order);
                 q.putInt(ContentResolver.QUERY_ARG_LIMIT, limit);
                 q.putInt(MATCH_PENDING, 1); // include pictures still being written, so a pick can wait for them
