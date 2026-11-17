@@ -2,7 +2,7 @@ __id__ = "voice_send"
 __name__ = "Voice Send"
 __description__ = "Say \"send\" while dictating with Gboard voice typing and the message goes out, exactly like tapping the send button. Say \"paste\" and the clipboard text goes in. Say \"screenshot\" or \"picture\" and your newest screenshot or camera photo is attached, say it again for the one before. Say \"select all\" and everything in the message box is selected. Works on the first try, right after a sentence or spoken punctuation. The Enter key, Send by Enter and keyboard suggestions stay as they are. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 __min_version__ = "12.5.1"
 
 # Two routes to the same tap of the send button.
@@ -62,6 +62,9 @@ __min_version__ = "12.5.1"
 #    lifts, with a light tick each (unless the app's vibration is off). A short tap still opens the
 #    attach menu; stock XF has nothing on a long press of that button. ClipHold (Java): the view's
 #    own long press detection plus one posted repeat while held. Its own switch.
+#    "Hold inserts" picks what a hold adds: the newest screenshots, or the newest images of any
+#    folder (one MediaStore Images query by date added, on the same background thread; hidden
+#    folders are never taken; nothing found falls back to the screenshot lookup).
 #
 # 7. Spoken "select all". The same watch, the same voice typing window: when the last words of a
 #    finished chunk are "select all", they are dropped and everything in the message box is
@@ -81,7 +84,7 @@ from java import jclass
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class, get_private_field
 from client_utils import get_last_fragment
-from ui.settings import Header, Switch
+from ui.settings import Header, Switch, Selector, Divider
 
 TOKEN = "handlesSendAction"
 IME_ACTION_SEND = 4
@@ -91,6 +94,9 @@ MICWATCH = "com.firestarter.voicesend.MicWatch"
 SHOTTRAY = "com.firestarter.voicesend.ShotTray"
 CLIPHOLD = "com.firestarter.voicesend.ClipHold"
 CAPTION_MAX = 1024
+# "Hold inserts": 0 the newest screenshots, 1 the newest images of any folder (ShotTray.ANY = 2)
+HOLD_DEFAULT = 1
+HOLD_ITEMS = ("Most recent screenshots", "Most recent images (any folder)")
 _TRAIL = " \t\n.!?"
 
 
@@ -271,9 +277,12 @@ class VoiceSendPlugin(BasePlugin):
                    subtext="While dictating, saying picture as the last word attaches the newest photo from your camera roll to the message you are writing. Say it again for the one before it. Nothing is sent until you send."),
             Switch(key="select_all", text="Say \"select all\" to select", default=True,
                    subtext="While dictating, saying select all as the last words selects everything in the message box and shows Cut, Copy and Paste."),
-            Switch(key="clip_hold", text="Hold the paperclip for screenshots", default=True,
-                   subtext="A long press on the paperclip attaches your newest screenshot and keeps adding the one before it while you hold. A short tap opens the attach menu as before.",
+            Switch(key="clip_hold", text="Hold the paperclip to attach", default=True,
+                   subtext="A long press on the paperclip attaches your newest picture and keeps adding the one before it while you hold. A short tap opens the attach menu as before.",
                    on_change=self._on_clip_toggle),
+            Selector(key="hold_source", text="Hold inserts: " + HOLD_ITEMS[1 if self._hold_any() else 0],
+                     default=HOLD_DEFAULT, items=list(HOLD_ITEMS), on_change=self._on_hold_source),
+            Divider(text="Most recent images takes the newest image on the phone from any folder: a screenshot, a camera photo, a download or a picture you saved from a chat. Hidden folders are never used."),
         ]
 
     def on_plugin_load(self):
@@ -325,6 +334,7 @@ class VoiceSendPlugin(BasePlugin):
             if self.tray is not None:
                 self.clip = self.loader.loadClass(CLIPHOLD)
                 self.clip.getField("enabled").setBoolean(None, bool(self.get_setting("clip_hold", True)))
+                self._on_hold_source()
                 V = jclass("android.view.View")
                 self.clip_arm = self.clip.getMethod("arm", V, V, jclass("android.widget.EditText"),
                                                     jclass("android.view.ViewGroup"), jclass("java.lang.Object"))
@@ -518,7 +528,8 @@ class VoiceSendPlugin(BasePlugin):
             self.hook_method(icw.getDeclaredMethod("setComposingText", CS, INT), ComposeTrace())
         AU = jclass("org.telegram.messenger.AndroidUtilities")
         AU.runOnUIThread(self._r(self._prep_open))
-        _log("loaded %s%s" % (__version__, " debug" if self.debug else ""))
+        _log("loaded %s%s, hold inserts %s" % (__version__, " debug" if self.debug else "",
+                                               "images of any folder" if self._hold_any() else "screenshots"))
 
     def _load_micwatch(self, ctx):
         """The tiny MicWatch class ships as a dex inside this file (see the end of the file)."""
@@ -761,6 +772,20 @@ class VoiceSendPlugin(BasePlugin):
                 self.clip.getField("enabled").setBoolean(None, bool(enabled))
         except Exception as e:
             self._err("clip toggle", e)
+
+    def _hold_any(self):
+        """Is "Hold inserts" set to the newest images of any folder? Anything unreadable: screenshots."""
+        try:
+            return int(self.get_setting("hold_source", HOLD_DEFAULT)) == 1
+        except Exception:
+            return False
+
+    def _on_hold_source(self, *_):
+        try:
+            if self.clip is not None:
+                self.clip.getField("kind").setInt(None, 2 if self._hold_any() else 0)
+        except Exception as e:
+            self._err("hold source", e)
 
     def _on_shot_toggle(self, enabled):
         try:
